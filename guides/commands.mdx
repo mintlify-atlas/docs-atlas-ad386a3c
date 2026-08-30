@@ -1,5 +1,5 @@
 ---
-title: "Pi Observational Memory slash commands reference"
+title: "Pi Observational Memory slash commands: complete reference"
 sidebarTitle: "Commands"
 description: "Complete reference for /om, /om:status, /om:compact, and /om:consolidate — what each command does, its output fields, and when it is a no-op."
 ---
@@ -23,7 +23,7 @@ Pi Observational Memory exposes four slash commands. Three of them (`/om:status`
 
 The per-session on/off gate. Running `/om` with no argument **toggles** the current state. Use `/om on` or `/om off` to set it explicitly.
 
-```
+```text
 /om          # toggle
 /om on       # enable
 /om off      # disable
@@ -54,7 +54,7 @@ Prints a full snapshot of the extension's current state. Useful for diagnosing s
 
 Example output:
 
-```
+```text
 om status
   observers in flight: 2 / 4
   active observations: 47
@@ -121,7 +121,7 @@ om status
 
 Forces an immediate compaction, bypassing the `compactAtContextTokens` threshold check. This calls pi's `ctx.compact()` directly.
 
-```
+```text
 /om:compact
 ```
 
@@ -140,7 +140,7 @@ Calling `/om:compact` manually is safe at any time. It is equivalent to what the
 
 Forces an immediate consolidation, bypassing the `consolidateAtPoolTokens` threshold check. Promotes the oldest observations above `poolTargetTokens` into durable `.memory/<sessionId>/` topic files via a consolidator subprocess.
 
-```
+```text
 /om:consolidate
 ```
 

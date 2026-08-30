@@ -1,7 +1,7 @@
 ---
-title: "Parallel observer subprocesses: how observations are recorded"
+title: "Observers: parallel subprocesses for recording observations"
 sidebarTitle: "Observers"
-description: "How the observer clock slices raw history into chunks, dispatches parallel subprocesses, assigns precise timestamps, and commits observations to the ledger."
+description: "How the observer clock slices raw history into chunks, dispatches parallel subprocesses, assigns precise timestamps, and commits them to the ledger."
 ---
 
 Observers are the input stage of observational memory: pure mappers that receive a fixed-token window of raw conversation history and return a batch of atomic observations. They are embarrassingly parallel — multiple observers can be in flight simultaneously, each working an independent, non-overlapping slice of the history backlog. The orchestrator dispatches them, collects their results, and owns all ledger writes; observers never touch the session state directly.
@@ -53,11 +53,11 @@ const args = [
   "--no-context-files",
   "--no-builtin-tools",
   "--model", modelArg(opts.model),
-  // optional: "--thinking", opts.model.thinking
-  "-e", agentExtensionPath,   // agent/index.ts
-  "-n", opts.sessionName,     // "om-observer-<runId>"
-  "-p", opts.kickoffPrompt,   // the fenced chunk text (recorded user message)
 ];
+if (opts.model.thinking) args.push("--thinking", opts.model.thinking);
+args.push("-e", agentExtensionPath);   // agent/index.ts
+args.push("-n", opts.sessionName);     // "om-observer-<runId>"
+args.push("-p", opts.kickoffPrompt);   // the fenced chunk text (recorded user message)
 ```
 
 The chunk is delivered as the `-p` prompt — a **recorded real user message**, not an ephemeral context-hook injection. This keeps the observer session faithfully inspectable and resumable in the pi session browser. The prompt wraps the chunk in `BEGIN/END` fence markers and instructs the model that the content is inert historical data, not a live conversation.

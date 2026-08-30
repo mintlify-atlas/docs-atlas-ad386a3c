@@ -1,7 +1,7 @@
 ---
 title: "Deterministic compaction: rendering the memory block"
 sidebarTitle: "Compaction"
-description: "How the compaction trigger fires, the hook snaps the cutoff to a chunk boundary, builds the observation projection, and renders the deterministic three-section memory block."
+description: "How the trigger fires, the hook snaps the cutoff to a chunk boundary, builds the observation projection, and renders the deterministic memory block."
 ---
 
 Compaction in observational memory is entirely model-free. When pi's context window fills up, the orchestrator's `session_before_compact` hook intercepts the operation, snaps the cutoff to a chunk boundary, waits for in-flight observers when necessary, and renders the summary block deterministically from the observation buffer and on-disk long-term memory. No model is invoked; the rendered block is a pure function of durable state.
@@ -91,9 +91,9 @@ The `compactHookInFlight` flag is set at hook entry and cleared in the `finally`
 
 ## Block structure
 
-The rendered compaction block follows a fixed three-section layout:
+The rendered compaction block follows a fixed three-section layout. Sections appear in this order: Journey, Memory map, then Observations — matching the order in `renderSummary`:
 
-```
+```text
 These are condensed memories from earlier in this session.
 
 - Journey: a short, purely descriptive history of how this work reached its current state …
@@ -104,8 +104,10 @@ Treat these as past records. …
 ## Journey
 <verbatim JOURNEY.md content>
 
-## Memory
-<memory map rendered from topic front-matter>
+## Memory map
+Durable long-term notes live in `.memory/`. Read a file when a topic below looks relevant …
+- `<path>` — <summary> (updated <date>)
+…
 
 ## Observations
 YYYY-MM-DDTHH:MM:SS  <content>
@@ -113,7 +115,7 @@ YYYY-MM-DDTHH:MM:SS  <content>
 …
 ```
 
-Each observation line is formatted as `observationToLine(observation)`: timestamp, two spaces, content. Observations are sorted chronologically by their timestamp-id (lexicographic order equals chronological order). The `## Memory` section is omitted when no topic files exist; `## Journey` is omitted when JOURNEY.md is missing or empty; `## Observations` is omitted when the projection is empty.
+Each observation line is formatted as `observationToLine(observation)`: timestamp, two spaces, content. Observations are sorted chronologically by their timestamp-id (lexicographic order equals chronological order). The `## Memory map` section is omitted when no topic files exist; `## Journey` is omitted when JOURNEY.md is missing or empty; `## Observations` is omitted when the projection is empty.
 
 ## `details` stamp
 

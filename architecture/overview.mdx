@@ -1,7 +1,7 @@
 ---
-title: "Architecture overview: how observational memory is structured"
+title: "Architecture overview: how observational memory works"
 sidebarTitle: "Overview"
-description: "A two-process model — an in-process orchestrator extension and headless subprocess workers — wired together by a branch-local ledger and tiered memory store."
+description: "A two-process model — in-process orchestrator extension plus headless subprocess workers — wired by a branch-local ledger and tiered memory store."
 ---
 
 Pi Observational Memory is built around a strict separation between an **orchestrator** that lives inside the master pi session and **worker subprocesses** that run as independent headless pi sessions. The orchestrator is purely event-driven: it listens for pi lifecycle events, writes ledger entries, fires compaction, and updates the TUI. The workers do the model work — distilling raw conversation into observations, and promoting aged observations into durable topic files — entirely out of process, so they never block the main agent loop.
@@ -38,7 +38,7 @@ The system moves through three parallel feedback loops:
 
 ## Repository layout
 
-```
+```text
 pi-observational-memory/
 ├── src/                    # Master orchestrator extension
 │   ├── index.ts            # Extension entry point, session lifecycle, commands
@@ -46,7 +46,7 @@ pi-observational-memory/
 │   ├── runtime.ts          # In-process state (flags, in-flight maps, gauges)
 │   ├── ids.ts              # Orchestrator timestamp assignment at commit
 │   ├── tokens.ts           # Token estimation utilities
-│   ├── ledger/             # Entry types, fold, projection, render, serialize
+│   ├── ledger/             # Entry types, fold, projection, render, serialize, pool
 │   ├── hooks/              # observer-trigger, consolidator-trigger, compaction-hook, compaction-trigger
 │   ├── memory/             # paths, index-render, session helpers
 │   ├── spawn/              # launch (worker argv/env builder), runs (result/cost file paths)
@@ -54,6 +54,7 @@ pi-observational-memory/
 │   └── ui/                 # TUI status controller
 └── agent/                  # Shared worker extension (loaded into every subprocess via -e)
     ├── index.ts            # Branches on OM_WORKER env var → registers role
+    ├── cost.ts             # Worker cost file writer (shared across roles)
     ├── observer/           # OBSERVER_SYSTEM prompt, record_observations tool
     └── consolidator/       # CONSOLIDATOR_SYSTEM prompt, scoped file tools
 ```

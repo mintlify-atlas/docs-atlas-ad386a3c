@@ -1,7 +1,7 @@
 ---
-title: "Configuration options for Pi Observational Memory"
+title: "Pi Observational Memory: all configuration options"
 sidebarTitle: "Config Options"
-description: "Complete reference for every key in the observational-memory config namespace — types, defaults, and the effect each option has on observers, compaction, and consolidation."
+description: "Every key in the observational-memory config namespace with its type, default value, and effect on observers, compaction, and consolidation."
 ---
 
 Configuration lives in the `observational-memory` namespace inside `~/.pi/agent/settings.json` (global, applied to every project) or `.pi/settings.json` at the project root (project-scoped, overrides the global file). Settings are merged shallowly: project values win over global values, which win over built-in defaults. The environment variable `PI_OM_PASSIVE` overrides both files for the `passive` flag and is the highest-precedence source. Unknown keys and malformed values are silently ignored — the loader falls back to the default for each affected field.

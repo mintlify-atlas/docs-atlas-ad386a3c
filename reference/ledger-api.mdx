@@ -1,7 +1,7 @@
 ---
 title: "Ledger API: entry types, fold, and projection functions"
 sidebarTitle: "Ledger API"
-description: "TypeScript types, constants, and pure functions exported from the ledger module for reading and writing the observation ledger."
+description: "TypeScript types, constants, and pure functions exported from the ledger module for reading, folding, projecting, and writing to the observation ledger."
 ---
 
 The ledger module (`src/ledger/`) provides the types, constants, and pure functions for reading and writing the observation ledger. Every piece of short-term memory — observations recorded by workers, tombstones applied by the consolidator, cost records, compaction details — flows through these types. The module is entirely model-free: it contains no I/O, no subprocess calls, and no side effects, making its functions safe to call from any extension hook.
@@ -254,7 +254,7 @@ Observations are sorted chronologically by timestamp before rendering. Each line
 
 ## Progress functions
 
-Three utility functions measure buffer and context progress against configured thresholds. All operate on a branch array from `getBranch()`.
+Two utility functions measure raw-history coverage progress against configured thresholds. Both operate on a branch array from `getBranch()`.
 
 ### `rawTokensSinceObservationCoverage(branch)`
 
@@ -275,9 +275,11 @@ function latestCoverageMarkerId(
 ): string | undefined
 ```
 
+## Pool functions
+
 ### `poolTokens(observations)`
 
-Sums the `tokenCount` field of an array of observations. Used by the runtime to compute the current pool size and compare against `config.consolidateAtPoolTokens`.
+Sums the `tokenCount` field of an array of observations. Used by the runtime to compute the current pool size and compare against `config.consolidateAtPoolTokens`. Defined in `src/ledger/pool.ts`.
 
 ```typescript
 function poolTokens(observations: Observation[]): number

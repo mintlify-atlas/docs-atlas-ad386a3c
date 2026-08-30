@@ -1,7 +1,7 @@
 ---
 title: "Installing Pi Observational Memory as a pi extension"
 sidebarTitle: "Installation"
-description: "Clone the repo, run npm install, and register Pi Observational Memory as a global or project-local pi extension. Default-off, so global registration is safe."
+description: "Clone the repo, npm install, then register Pi Observational Memory as a pi extension globally or per project. Off by default; global registration is safe."
 ---
 
 Pi Observational Memory is distributed as source and loaded directly by pi's extension system. There is no separate npm publish step — you clone the repository, install its dev dependencies, and point pi at the entry file. Because the extension is **off by default in every session**, registering it globally adds no overhead to projects that never enable it.

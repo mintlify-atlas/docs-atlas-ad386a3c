@@ -1,7 +1,7 @@
 ---
-title: "The branch-local observation ledger"
+title: "Ledger: om.* custom entries and observation storage"
 sidebarTitle: "Ledger"
-description: "How om.* custom entries store observations, tombstones, cost, and compaction state — including folding semantics, watermarks, and /tree-correct cost monotonicity."
+description: "How om.* custom entries record observations, tombstones, cost, and compaction state — including fold semantics, watermarks, and monotonic cost under /tree."
 ---
 
 The ledger is the authoritative short-term state store for observational memory. It is not a separate database — it is a sequence of pi **custom entries** written directly into the session transcript, each namespaced under `om.*`. Because pi's branch history is the storage medium, short-term memory rolls back natively when the user navigates with `/tree`. All reads and writes go through the orchestrator; worker subprocesses never touch the ledger directly.

@@ -1,14 +1,14 @@
 ---
-title: "How Pi Observational Memory works"
+title: "How Pi Observational Memory works: five pipeline stages"
 sidebarTitle: "How It Works"
-description: "The full pipeline: raw conversation chunks flow through parallel observer subprocesses into a branch-local ledger, compact into a deterministic block, then drain via the consolidator to durable .memory/ files."
+description: "All five pipeline stages explained: observer clock, observation unit, compaction, consolidator, and JOURNEY.md — from raw chunks to durable topic files."
 ---
 
 Pi Observational Memory sits between the raw pi session history and the agent's context window. As conversation grows, observer subprocesses run in the background cutting fixed-token chunks of raw history and distilling each into a set of atomic observations that are committed to the master session's branch-local ledger. At context pressure the extension renders those observations — together with a live memory map and running project narrative — into the compaction block, deterministically and without any model call. Meanwhile a consolidator subprocess drains the oldest observations from the buffer into durable per-session topic files, keeping the buffer bounded and the long-term store navigable. Every stage in the pipeline is an ordinary recorded pi session visible in the session browser.
 
 ## Pipeline overview
 
-```
+```text
 raw chunks              parallel observers          observations
 (token-bounded,  →→→  (subprocess pi,      →→→   {timestamp,
  fixed slices)          headless)                   content}
@@ -89,7 +89,7 @@ Because these are branch-local ledger entries with a `coversUpToId` watermark, t
 
 ## Stage 3: Compaction
 
-Compaction fires on `agent_end` when context usage reaches `compactAtContextTokens` (default 150,000 tokens). The trigger calls `ctx.compact()`, which disconnects the agent loop; the `session_before_compact` hook then runs to produce the summary block.
+Compaction fires on `turn_end` when context usage reaches `compactAtContextTokens` (default 150,000 tokens). The trigger calls `ctx.compact()`, which disconnects the agent loop; the `session_before_compact` hook then runs to produce the summary block.
 
 The hook is deterministic and model-free:
 

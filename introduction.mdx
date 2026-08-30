@@ -1,10 +1,10 @@
 ---
-title: "Pi Observational Memory: tiered memory for pi"
+title: "Pi Observational Memory: tiered memory for pi agent"
 sidebarTitle: "Introduction"
-description: "Tiered, subprocess-backed memory for pi: parallel observers feed a branch-local ledger buffer; a consolidator promotes aging observations to durable topic files. Default OFF."
+description: "Tiered subprocess memory for pi: observers build a branch-local ledger; the consolidator drains aging observations into durable per-session topic files."
 ---
 
-Pi Observational Memory is a TypeScript extension for the [pi coding agent](https://github.com/amosblomqvist/pi-observational-memory) that gives your pi sessions persistent, structured memory without disrupting normal workflow. It runs entirely as background subprocess activity — parallel observer processes distill raw conversation chunks into atomic observations, a branch-local ledger stores them correctly under `/tree`, and a consolidator drains the oldest observations into durable per-session topic files once the buffer grows large enough. The extension ships default-off so it is completely invisible until you explicitly enable it for a session.
+Pi Observational Memory is a TypeScript extension for the [pi coding agent](https://github.com/earendil-works/pi) that gives your pi sessions persistent, structured memory without disrupting normal workflow. It runs entirely as background subprocess activity — parallel observer processes distill raw conversation chunks into atomic observations, a branch-local ledger stores them correctly under `/tree`, and a consolidator drains the oldest observations into durable per-session topic files once the buffer grows large enough. The extension ships default-off so it is completely invisible until you explicitly enable it for a session.
 
 ## The two-tier model
 
@@ -22,19 +22,19 @@ The extension ships in the global extensions folder and attaches to every pi ses
 
 Enable it for the current session:
 
-```
+```text
 /om on
 ```
 
 Toggle it:
 
-```
+```text
 /om
 ```
 
 Disable it:
 
-```
+```text
 /om off
 ```
 

@@ -1,7 +1,7 @@
 ---
-title: "Configuring Pi Observational Memory"
+title: "Pi Observational Memory configuration key reference"
 sidebarTitle: "Configuration"
-description: "All config keys for the observational-memory namespace in settings.json, their defaults, and the PI_OM_PASSIVE env override. Project settings override global."
+description: "Config keys for the observational-memory namespace in settings.json, their defaults, and the PI_OM_PASSIVE env override. Project settings override global."
 ---
 
 Pi Observational Memory reads its configuration from pi's standard `settings.json` files under the `"observational-memory"` namespace key. Global settings in `~/.pi/agent/settings.json` apply to all projects; a project-local `.pi/settings.json` at the working directory root overrides them on a per-key basis. The environment variable `PI_OM_PASSIVE` can override the `passive` flag at process level, taking precedence over both files.

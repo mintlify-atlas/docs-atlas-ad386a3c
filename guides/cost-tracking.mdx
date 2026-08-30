@@ -1,7 +1,7 @@
 ---
-title: "Tracking worker costs in Pi Observational Memory"
+title: "Tracking worker run costs in Pi Observational Memory"
 sidebarTitle: "Cost Tracking"
-description: "How observer and consolidator subprocess costs are captured via pi's built-in metrics, stored as om.cost ledger entries, and surfaced in the footer and /om:status."
+description: "How worker costs are captured from pi's built-in metrics, stored as om.cost ledger entries, and surfaced in the footer and /om:status across all branches."
 ---
 
 Every worker in Pi Observational Memory — observers and the consolidator — is an ordinary pi subprocess session. Pi tracks model spend natively in each session via `usage.cost.total`. The extension captures that figure after each worker exits and folds it into the master session's ledger, where it accumulates monotonically across the full session tree.
@@ -10,7 +10,7 @@ Every worker in Pi Observational Memory — observers and the consolidator — i
 
 Each worker subprocess includes the extension's worker-side code (`agent/index.ts`). When the worker's session shuts down, that code reads `usage.cost.total` from pi's built-in metrics and writes it to a small JSON file in the session's `.runs/` directory:
 
-```
+```text
 .memory/<sessionId>/.runs/<runId>.cost.json
 ```
 

@@ -1,7 +1,7 @@
 ---
-title: "Configuring observer and consolidator models"
+title: "Configuring models for observer and consolidator workers"
 sidebarTitle: "Models"
-description: "How to specify provider, model id, and thinking level for the observer and consolidator workers — including default models, role-appropriate thinking levels, and cost trade-offs."
+description: "Set provider, model id, and thinking level for observer and consolidator workers — built-in defaults, per-role thinking levels, and cost trade-offs."
 ---
 
 Both the observer and the consolidator run as headless pi subprocess sessions. Because they are full pi sessions, each can be independently pointed at any provider and model that pi supports. Their model configuration lives under the `models` key in the `observational-memory` namespace and is the primary lever for balancing quality, throughput, and cost across the memory pipeline.
