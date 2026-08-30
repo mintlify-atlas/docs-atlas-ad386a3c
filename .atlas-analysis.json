@@ -1,0 +1,92 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Pi Observational Memory",
+  "projectDescription": "A tiered, subprocess-backed memory extension for the pi coding agent that uses parallel observers to distill conversation history into atomic observations, a branch-local ledger for short-term recall, and a consolidator to promote aging observations into durable per-session topic files.",
+  "theme": "luma",
+  "primaryColor": "#6366F1",
+  "lightColor": "#EEF2FF",
+  "darkColor": "#312E81",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "how-it-works"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/installation",
+              "guides/configuration",
+              "guides/commands",
+              "guides/long-term-memory",
+              "guides/cost-tracking",
+              "guides/tree-correctness"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/ledger",
+              "architecture/observers",
+              "architecture/consolidator",
+              "architecture/compaction"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Configuration Reference",
+            "pages": [
+              "reference/config-options",
+              "reference/models"
+            ]
+          },
+          {
+            "group": "API Reference",
+            "pages": [
+              "reference/ledger-api",
+              "reference/memory-api",
+              "reference/spawn-api"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Parallel observer subprocesses that distill raw conversation chunks into atomic observations",
+    "Branch-local ledger (om.observations.recorded) that stays correct under /tree navigation",
+    "Deterministic, model-free compaction rendering the observation buffer into a summary block",
+    "Consolidator that promotes aging observations into durable per-session .memory/<sessionId>/ topic files",
+    "JOURNEY.md — a running descriptive prose history pushed into every compaction block for orientation",
+    "Per-session on/off gate (default OFF) for safe global extension deployment",
+    "Cost tracking via pi's built-in usage metrics, surfaced in the footer and /om:status",
+    "Fork/clone seeding of long-term memory from parent sessions"
+  ],
+  "publicApiSurface": [
+    "/om, /om on, /om off — per-session on/off gate command",
+    "/om:status — show workers, buffer, clocks, cost, topic files, journey size",
+    "/om:compact — force compaction now (ignores threshold)",
+    "/om:consolidate — force consolidation now (ignores pool threshold)",
+    "Config: observational-memory namespace in ~/.pi/agent/settings.json or .pi/settings.json",
+    "Config: chunkTokens, chunkOverlapTokens, poolTargetTokens, consolidateAtPoolTokens, compactAtContextTokens, tailTokens, journeyTargetTokens, observerConcurrency",
+    "Config: models.observer / models.consolidator (provider, id, thinking)",
+    "Config: passive (bool), debugLog (bool), resumeAfterMidRunCompaction (bool)",
+    "Env: PI_OM_PASSIVE=1 — forces passive mode (disables all triggers)",
+    "Ledger entry types: om.observations.recorded, om.observations.dropped, om.enabled, om.cost, om.folded, om.resume",
+    "Memory layout: .memory/<sessionId>/INDEX.md, .memory/<sessionId>/<topic>.md, .memory/<sessionId>/JOURNEY.md, .memory/<sessionId>/.runs/",
+    "src/index.ts — default export: observationalMemory(pi: ExtensionAPI)",
+    "agent/index.ts — default export: omWorker(pi: ExtensionAPI), env-dispatched on OM_WORKER=observer|consolidator"
+  ]
+}

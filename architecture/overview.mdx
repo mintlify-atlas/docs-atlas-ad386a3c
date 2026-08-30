@@ -1,0 +1,84 @@
+---
+title: "Architecture overview: how observational memory is structured"
+sidebarTitle: "Overview"
+description: "A two-process model — an in-process orchestrator extension and headless subprocess workers — wired together by a branch-local ledger and tiered memory store."
+---
+
+Pi Observational Memory is built around a strict separation between an **orchestrator** that lives inside the master pi session and **worker subprocesses** that run as independent headless pi sessions. The orchestrator is purely event-driven: it listens for pi lifecycle events, writes ledger entries, fires compaction, and updates the TUI. The workers do the model work — distilling raw conversation into observations, and promoting aged observations into durable topic files — entirely out of process, so they never block the main agent loop.
+
+## Component map
+
+**Master session — orchestrator extension (`src/`)**
+
+The orchestrator extension is loaded once per session. It owns:
+
+- **Event-driven clocks** — `turn_end` and `agent_start` listeners that evaluate the observer and consolidator triggers on every turn boundary
+- **Ledger writes** — all `om.*` custom entries are appended by the orchestrator; workers never write to the session ledger directly
+- **Compaction hook** — a `session_before_compact` handler that snaps the cutoff to a chunk boundary, waits for in-flight observers when needed, and renders the deterministic memory block
+- **Compaction trigger** — a `turn_end` handler that fires `ctx.compact()` once live context usage crosses `compactAtContextTokens`
+- **TUI** — footer gauges (next-observer progress, pool fullness, context usage), per-worker spinner widgets, and coalesced start/finish toasts
+- **Commands** — `/om on`, `/om off`, `/om status`, `/om compact`, `/om consolidate`
+
+**Worker sessions — subprocess pi extensions (`agent/`)**
+
+Workers are spawned as plain headless `pi -p` sessions. There are two roles, selected by the `OM_WORKER` environment variable:
+
+- **Observer** — receives a fixed-token slice of raw conversation history as its recorded kickoff prompt (`-p`), calls the `record_observations` terminal tool one or more times, and exits. The orchestrator reads the result file and commits an `om.observations.recorded` ledger entry.
+- **Consolidator** — receives the overflow observation batch plus the current JOURNEY.md and INDEX.md as its kickoff prompt. It uses scoped `read`/`write`/`edit`/`ls`/`grep` tools confined to `.memory/` to author and update topic files, then exits. The orchestrator tombstones the handed batch on clean exit.
+
+## Event flow
+
+The system moves through three parallel feedback loops:
+
+1. **Observer loop** — on `turn_end` / `agent_start`, the observer clock checks how many raw tokens have accumulated since the latest coverage watermark. When the backlog reaches `chunkTokens`, `evaluateObserverTriggers` enters a `while` loop that selects a source slice, advances the in-memory dispatch watermark, and spawns an observer subprocess for each available concurrency slot. Each observer is tracked in `runtime.observersInFlight`. When the subprocess exits cleanly, the orchestrator reads the result file, assigns precise timestamps, and appends `om.observations.recorded` to the ledger.
+
+2. **Compaction loop** — on `turn_end`, the compaction trigger checks whether live context usage has crossed `compactAtContextTokens`. When it has, `ctx.compact()` is called immediately (no observer idle-wait at this point — that happens inside the hook). The `session_before_compact` hook snaps the cutoff, optionally waits for in-flight observers, builds the projection, reads JOURNEY.md and the memory map from disk, renders the summary block, and returns it to pi.
+
+3. **Consolidator loop** — on `turn_end` / `agent_start`, the consolidator clock checks whether the active observation pool has grown past `consolidateAtPoolTokens`. When it has, the oldest overflow is selected and handed to a single background consolidator subprocess. On clean exit, the orchestrator appends `om.observations.dropped` tombstones for the entire handed batch that is still active.
+
+## Repository layout
+
+```
+pi-observational-memory/
+├── src/                    # Master orchestrator extension
+│   ├── index.ts            # Extension entry point, session lifecycle, commands
+│   ├── config.ts           # Config schema, defaults, layered loader
+│   ├── runtime.ts          # In-process state (flags, in-flight maps, gauges)
+│   ├── ids.ts              # Orchestrator timestamp assignment at commit
+│   ├── tokens.ts           # Token estimation utilities
+│   ├── ledger/             # Entry types, fold, projection, render, serialize
+│   ├── hooks/              # observer-trigger, consolidator-trigger, compaction-hook, compaction-trigger
+│   ├── memory/             # paths, index-render, session helpers
+│   ├── spawn/              # launch (worker argv/env builder), runs (result/cost file paths)
+│   ├── commands/           # /om status, compact, consolidate
+│   └── ui/                 # TUI status controller
+└── agent/                  # Shared worker extension (loaded into every subprocess via -e)
+    ├── index.ts            # Branches on OM_WORKER env var → registers role
+    ├── observer/           # OBSERVER_SYSTEM prompt, record_observations tool
+    └── consolidator/       # CONSOLIDATOR_SYSTEM prompt, scoped file tools
+```
+
+The `src/` tree is the orchestrator; it never runs in a worker subprocess. The `agent/` tree is the shared worker extension, registered via `-e agent/index.ts`; it never runs in the master session.
+
+## Worker observability
+
+<Note>
+Every worker subprocess is a fully recorded pi session stored in `~/.pi/agent/sessions` under the project path. Open any worker session in the pi session browser to inspect the exact conversation chunk it received, the `record_observations` tool calls it made, and the raw output it produced. Because the chunk is passed as the real `-p` kickoff prompt (not an ephemeral context injection), the session is faithfully replayable and resumable.
+</Note>
+
+## Detailed architecture pages
+
+<CardGroup cols={2}>
+  <Card title="Ledger" icon="book" href="/architecture/ledger">
+    The `om.*` custom-entry ledger: entry types, observation schema, folding, watermarks, and cost monotonicity under `/tree`.
+  </Card>
+  <Card title="Observers" icon="eye" href="/architecture/observers">
+    Observer clock, chunk selection, parallel dispatch, subprocess spawn flags, timestamp assignment, and result commit.
+  </Card>
+  <Card title="Consolidator" icon="database" href="/architecture/consolidator">
+    Consolidator clock, oldest-first promotion, JOURNEY.md maintenance, tombstoning, and `/tree` interaction.
+  </Card>
+  <Card title="Compaction" icon="compress" href="/architecture/compaction">
+    Compaction trigger, cutoff snapping, fast-path observer skip, projection build, and rendered block structure.
+  </Card>
+</CardGroup>

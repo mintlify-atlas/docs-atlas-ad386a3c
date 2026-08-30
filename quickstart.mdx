@@ -1,47 +1,172 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get started with Pi Observational Memory"
+sidebarTitle: "Quickstart"
+description: "Install Pi Observational Memory, register it as a global pi extension, enable it with /om on, and verify it is working with /om:status in under five minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+Pi Observational Memory is a pi extension, so setup is a two-step process: clone and install the repo, then tell pi where to find it. Once registered, the extension attaches to every pi session automatically — but it stays completely silent until you run `/om on` inside the session where you want it active.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Note>
+  The extension is **default OFF** per session. Even after registration it does nothing until you enable it explicitly. This makes it safe to register globally without affecting sessions where you do not want memory activity.
+</Note>
 
 ## Prerequisites
 
-Before you begin, you must have:
+You need a working pi coding agent installation. Verify it with:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+```bash
+pi --version
+```
 
-## Get started
+If the command is not found, install pi before continuing.
+
+## Setup
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Clone the repository">
+    Clone the extension repo to a stable location on your machine. The path you choose here is the one you will register with pi.
 
     ```bash
-    npm install your-package
+    git clone https://github.com/amosblomqvist/pi-observational-memory
+    cd pi-observational-memory
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Install dependencies">
+    The extension's peer dependencies are the pi packages you already have globally. `npm install` resolves the dev dependencies (TypeScript, vitest) and makes the local build ready.
 
     ```bash
-    your-cli init
+    npm install
     ```
+
+    No build step is required — pi loads TypeScript extensions directly via `tsx`.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
 
-    ```bash
-    your-cli start
+  <Step title="Register as a global pi extension">
+    Open your global pi settings file at `~/.pi/agent/settings.json` (create it if it does not exist) and add the path to the extension's entry point under the `extensions` array:
+
+    ```jsonc title="~/.pi/agent/settings.json"
+    {
+      "extensions": [
+        "/path/to/pi-observational-memory/src/index.ts"
+      ]
+    }
     ```
+
+    Replace `/path/to/pi-observational-memory` with the absolute path to the directory you cloned into. After saving this file, pi will load the extension at the start of every new session.
+
+    <Tip>
+      You can also register the extension for a single project by adding it to `.pi/settings.json` in the project root instead of the global settings file. Project settings override global settings, so you can mix per-project and global configuration.
+    </Tip>
+  </Step>
+
+  <Step title="Start a pi session and enable observational memory">
+    Start pi in any project directory and enable the extension for this session:
+
+    ```
+    /om on
+    ```
+
+    Pi will confirm with a toast notification: `om enabled`. The footer status bar will show the `om` indicator, and the extension begins watching for conversation activity.
+
+    If you want the extension on by default for a project, you can set configuration in `.pi/settings.json` — but the on/off gate itself is always per-session and persisted in the ledger. There is no config key to make it globally on; the gate is intentionally manual.
+  </Step>
+
+  <Step title="Work normally — what you will see">
+    Continue the session as normal. As you interact with the agent, the extension fires observer subprocesses in the background each time the raw conversation history grows by `chunkTokens` (default 10,000 tokens).
+
+    In the TUI footer you will see the `om` status indicator. When an observer is running, a spinner widget appears:
+
+    ```
+    ◐ [observer]
+    ```
+
+    When it finishes:
+
+    ```
+    ✓ [observer] +4
+    ```
+
+    The `+4` is the number of observations the observer extracted from that chunk. Toast notifications appear for observer start, finish, and any errors:
+
+    ```
+    om: observer started (~10,000 tok)
+    om: observer +4 (~10,000 tok)
+    ```
+
+    If the active observation pool grows past `consolidateAtPoolTokens` (default 15,000 tokens), a consolidator subprocess starts in the background to promote the oldest observations into `.memory/<sessionId>/` topic files.
+  </Step>
+
+  <Step title="Check status with /om:status">
+    At any point run `/om:status` to see a full status report:
+
+    ```
+    om status
+      observers in flight: 0 / 4
+      active observations: 12
+      next observer: 3,412 / 10,000 tok
+      pool: 4,800 tok (target 10,000, consolidate at 15,000)
+      consolidator: idle
+      last compaction wait: skipped
+      topic files: 2
+      journey: ~380 / 1,000 tok
+      context: 42,000 / 150,000 tok
+      session cost: $0.0031 (3 runs)
+      last error: none
+    ```
+
+    | Field | What it shows |
+    |---|---|
+    | `observers in flight` | Active observer subprocesses vs the concurrency cap |
+    | `active observations` | Observations currently in the ledger buffer |
+    | `next observer` | Raw tokens accumulated since last chunk boundary vs `chunkTokens` |
+    | `pool` | Buffer token count, pool target, and consolidation threshold |
+    | `consolidator` | Whether a consolidator subprocess is currently running |
+    | `last compaction wait` | Whether the last compaction waited for in-flight observers or used the fast path |
+    | `topic files` | Number of `.memory/<sessionId>/<topic>.md` files written so far |
+    | `journey` | Current size of `JOURNEY.md` vs `journeyTargetTokens` target |
+    | `context` | Live context-window usage vs the `compactAtContextTokens` threshold |
+    | `session cost` | Total USD spent on observer and consolidator subprocesses this session |
+    | `last error` | Most recent worker error, if any |
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Commands reference
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+| Command | Effect |
+|---|---|
+| `/om` | Toggle observational memory on/off for this session |
+| `/om on` / `/om off` | Set the gate explicitly |
+| `/om:status` | Full status report (workers, buffer, clocks, cost) |
+| `/om:compact` | Force a compaction now, ignoring the token threshold |
+| `/om:consolidate` | Force a consolidation now, ignoring the pool threshold |
+
+## Configuration
+
+All configuration lives under the `observational-memory` namespace in `~/.pi/agent/settings.json` (global) or `.pi/settings.json` (project; overrides global). Here is the full set of keys with their defaults:
+
+```jsonc title="~/.pi/agent/settings.json"
+{
+  "observational-memory": {
+    "chunkTokens": 10000,
+    "chunkOverlapTokens": 0,
+    "poolTargetTokens": 10000,
+    "consolidateAtPoolTokens": 15000,
+    "compactAtContextTokens": 150000,
+    "tailTokens": 20000,
+    "journeyTargetTokens": 1000,
+    "observerConcurrency": 4,
+    "resumeAfterMidRunCompaction": true,
+    "models": {
+      "observer":     { "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "low" },
+      "consolidator": { "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "medium" }
+    },
+    "passive": false,
+    "debugLog": false
+  }
+}
+```
+
+<Tip>
+  Set `PI_OM_PASSIVE=1` in your environment to force `passive` mode (all triggers disabled) without editing any config file. This is useful for testing `/tree` branching in isolation without background subprocess activity.
 </Tip>

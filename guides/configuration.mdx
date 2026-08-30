@@ -1,0 +1,153 @@
+---
+title: "Configuring Pi Observational Memory"
+sidebarTitle: "Configuration"
+description: "All config keys for the observational-memory namespace in settings.json, their defaults, and the PI_OM_PASSIVE env override. Project settings override global."
+---
+
+Pi Observational Memory reads its configuration from pi's standard `settings.json` files under the `"observational-memory"` namespace key. Global settings in `~/.pi/agent/settings.json` apply to all projects; a project-local `.pi/settings.json` at the working directory root overrides them on a per-key basis. The environment variable `PI_OM_PASSIVE` can override the `passive` flag at process level, taking precedence over both files.
+
+## Example configuration
+
+```jsonc title="~/.pi/agent/settings.json  (or  <project>/.pi/settings.json)"
+{
+  "observational-memory": {
+    // Token budget for one observation chunk (fixed slice of raw history)
+    "chunkTokens": 10000,
+    // Overlap between adjacent chunks — default 0 in v1
+    "chunkOverlapTokens": 0,
+    // Buffer drains back toward this size after each consolidation
+    "poolTargetTokens": 10000,
+    // Pool size that triggers a consolidation run (roughly 150% of target)
+    "consolidateAtPoolTokens": 15000,
+    // Live context usage that triggers automatic compaction — tune per model
+    "compactAtContextTokens": 150000,
+    // Verbatim tail kept after the compaction cutoff; snaps to a chunk boundary
+    "tailTokens": 20000,
+    // Target size for JOURNEY.md; oldest segments compressed once past this
+    "journeyTargetTokens": 1000,
+    // Max simultaneous observer subprocesses
+    "observerConcurrency": 4,
+    // Auto-resume after a mid-run compaction (turn_end with pending tool work)
+    "resumeAfterMidRunCompaction": true,
+    // Power-user: disable all triggers without turning off the on/off gate
+    "passive": false,
+    // Emit NDJSON debug log
+    "debugLog": false,
+    "models": {
+      "observer":     { "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "low" },
+      "consolidator": { "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "medium" }
+    }
+  }
+}
+```
+
+Unknown keys are silently ignored. Invalid values (wrong type, non-positive integer where a positive integer is required) fall back to the compiled-in default.
+
+## Config key reference
+
+### Chunking and overlap
+
+<ParamField body="chunkTokens" type="number" default="10000">
+  Token size of one observation chunk — a fixed-boundary slice of raw conversation history. Every `chunkTokens` of new history beyond the observer watermark, a new observer subprocess is dispatched. Smaller values mean more frequent, lower-latency observation; larger values reduce subprocess overhead.
+</ParamField>
+
+<ParamField body="chunkOverlapTokens" type="number" default="0">
+  Token overlap between adjacent chunks. A value of `0` means each chunk is disjoint. Non-zero overlap lets consecutive observers share context across a chunk boundary. This is explicitly `0` in v1 by design; the field is present for future use.
+</ParamField>
+
+### Observation pool thresholds
+
+<ParamField body="poolTargetTokens" type="number" default="10000">
+  The target size of the active observation buffer after consolidation. When the consolidator finishes a run, it drops the observations it promoted; the buffer then drains back toward this target. Pairs with `consolidateAtPoolTokens` to form a high-water / low-water control loop.
+</ParamField>
+
+<ParamField body="consolidateAtPoolTokens" type="number" default="15000">
+  Active-pool token count that triggers a consolidation run. When the buffer exceeds this value, the consolidator subprocess is started to promote the oldest observations (those above `poolTargetTokens`) into durable `.memory/` topic files. Must be greater than `poolTargetTokens` for the drain cycle to be stable.
+</ParamField>
+
+### Compaction threshold
+
+<ParamField body="compactAtContextTokens" type="number" default="150000">
+  Live context-window usage (in tokens) that triggers automatic compaction on `turn_end`. Compaction waits for any in-flight observers before rendering the block. This should be set well below your model's hard context limit to leave room for the compacted summary and verbatim tail.
+</ParamField>
+
+### Tail and journey sizing
+
+<ParamField body="tailTokens" type="number" default="20000">
+  Size of the verbatim raw tail kept after the compaction cutoff. The cutoff snaps to an observation chunk boundary so no chunk straddles the cutoff and no history is double-represented — some entries may therefore be rendered into the summary block even if they fall within this token distance from the tip.
+</ParamField>
+
+<ParamField body="journeyTargetTokens" type="number" default="1000">
+  Target size of `.memory/<sessionId>/JOURNEY.md` in tokens. The consolidator appends a dated segment on each run; once the file grows past this target the oldest segments are compressed (recent history stays detailed). The journey is pushed verbatim into every compaction block.
+</ParamField>
+
+### Concurrency and process control
+
+<ParamField body="observerConcurrency" type="number" default="4">
+  Maximum number of simultaneous observer subprocesses. Each observer is a headless pi session; this cap prevents excessive subprocess fan-out on long sessions with many pending chunks.
+</ParamField>
+
+<ParamField body="resumeAfterMidRunCompaction" type="boolean" default="true">
+  When `true`, the extension automatically resumes the agent loop after a compaction that fired mid-run (a `turn_end` that still had pending tool work). A `turn_end` that is the run's terminal turn never triggers auto-resume regardless of this setting — it stops as if no compaction had occurred.
+</ParamField>
+
+<ParamField body="passive" type="boolean" default="false">
+  When `true`, disables all automatic triggers (observer dispatch, consolidation, compaction). The session on/off gate remains in effect — if the gate is on, manual commands (`/om:compact`, `/om:consolidate`) still work. This is a power-user setting, distinct from `/om off`: `passive` suppresses background activity without changing the gate state in the ledger.
+</ParamField>
+
+<ParamField body="debugLog" type="boolean" default="false">
+  When `true`, the extension emits an NDJSON debug log for internal state transitions. Useful for tracing observer dispatch timing and compaction snapping decisions.
+</ParamField>
+
+### Model selection
+
+<ParamField body="models.observer" type="object">
+  Model used for observer subprocesses. Accepts three sub-fields:
+
+  <Expandable title="Sub-fields">
+    <ResponseField name="provider" type="string" required>
+      The model provider identifier (e.g. `"openrouter"`, `"anthropic"`).
+    </ResponseField>
+    <ResponseField name="id" type="string" required>
+      The model id within that provider (e.g. `"z-ai/glm-5.3"`, `"claude-sonnet-4-6"`).
+    </ResponseField>
+    <ResponseField name="thinking" type="string">
+      Optional thinking budget level. One of: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`. Defaults to `"low"` for observers.
+    </ResponseField>
+  </Expandable>
+
+  Default: `{ "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "low" }`
+</ParamField>
+
+<ParamField body="models.consolidator" type="object">
+  Model used for the consolidator subprocess. Same shape as `models.observer`.
+
+  Default: `{ "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "medium" }`
+
+  The consolidator typically benefits from a higher thinking budget than observers because it must reason about existing topic file structure and decide how to merge or rewrite entries.
+</ParamField>
+
+## Environment override
+
+<ParamField body="PI_OM_PASSIVE" type="env" default="unset">
+  Set to `1`, `true`, `yes`, or `on` to force `passive: true` at the process level, overriding both global and project settings. Set to `0`, `false`, `no`, or `off` to force `passive: false`. This is the recommended way to suppress all background activity during testing without modifying any settings file.
+
+  ```bash
+  PI_OM_PASSIVE=1 pi
+  ```
+</ParamField>
+
+## Configuration precedence
+
+Settings are merged in this order (later sources win):
+
+1. Compiled-in defaults (`src/config.ts`)
+2. `~/.pi/agent/settings.json` — global
+3. `<project>/.pi/settings.json` — project-local
+4. `PI_OM_PASSIVE` env var — process-level passive override
+
+The `models` object is merged shallowly: a project-level `models.observer` entirely replaces the global `models.observer` — individual sub-fields are not merged across levels.
+
+<Tip>
+  Tune `compactAtContextTokens` per model. Large-context models (e.g. Gemini 2.0 with a 1M token window) can tolerate `800000` or higher, while smaller models may benefit from `80000`–`120000`. Set it well below the model's hard limit to leave room for the compaction summary block and verbatim tail.
+</Tip>

@@ -1,0 +1,193 @@
+---
+title: "How Pi Observational Memory works"
+sidebarTitle: "How It Works"
+description: "The full pipeline: raw conversation chunks flow through parallel observer subprocesses into a branch-local ledger, compact into a deterministic block, then drain via the consolidator to durable .memory/ files."
+---
+
+Pi Observational Memory sits between the raw pi session history and the agent's context window. As conversation grows, observer subprocesses run in the background cutting fixed-token chunks of raw history and distilling each into a set of atomic observations that are committed to the master session's branch-local ledger. At context pressure the extension renders those observations — together with a live memory map and running project narrative — into the compaction block, deterministically and without any model call. Meanwhile a consolidator subprocess drains the oldest observations from the buffer into durable per-session topic files, keeping the buffer bounded and the long-term store navigable. Every stage in the pipeline is an ordinary recorded pi session visible in the session browser.
+
+## Pipeline overview
+
+```
+raw chunks              parallel observers          observations
+(token-bounded,  →→→  (subprocess pi,      →→→   {timestamp,
+ fixed slices)          headless)                   content}
+                                                       │
+                                                       ▼
+                                              master ledger
+                                              (branch-local,
+                                               /tree-correct)
+                                                       │
+                                             ┌─────────┴─────────┐
+                                             ▼                   ▼
+                                      compaction block    consolidator
+                                      (deterministic,     (subprocess pi,
+                                       model-free)         one at a time)
+                                                                  │
+                                                                  ▼
+                                                    .memory/<sessionId>/
+                                                    (durable, per-session,
+                                                     grep-able; tombstones
+                                                     drain buffer)
+```
+
+The pipeline has five distinct stages. Each is described below.
+
+---
+
+## Stage 1: Observer clock
+
+Observers are triggered on the `turn_end` and `agent_start` events — the two natural quiet points in a pi session where background work can start without racing the agent loop.
+
+The clock measures raw tokens of new conversation history since the last committed `coversUpToId` watermark. Specifically, it reads the latest `om.observations.recorded` entry on the branch to find the furthest source-entry id already covered, then counts raw tokens after that point. When that count reaches `chunkTokens` (default 10,000), the extension cuts a slice and fires an observer.
+
+```typescript
+// From src/hooks/observer-trigger.ts
+while (runtime.observerSlotsAvailable > 0) {
+  const branch = sessionManager.getBranch();
+  const watermarkId = effectiveWatermarkId(runtime, branch);
+  const watermarkIndex = entryIndexForId(branch, watermarkId);
+  const remaining = rawTokensAfterIndex(branch, watermarkIndex);
+  if (remaining < runtime.config.chunkTokens) break;
+
+  const slice = selectSourceSlice(branch, watermarkId, runtime.config.chunkTokens);
+  if (slice.entries.length === 0 || !slice.coversUpToId) break;
+  // dispatch observer for this slice...
+}
+```
+
+Observers are embarrassingly parallel — multiple chunks can be in flight simultaneously, capped by `observerConcurrency` (default 4). Out-of-order completion is safe because each observer carries its own `coversUpToId` watermark identifying exactly which source entries it covered. There is also an in-memory `dispatchedCoversUpToId` that advances as chunks are dispatched, preventing duplicate dispatch before results are committed.
+
+---
+
+## Stage 2: Observation unit
+
+Each observer subprocess receives its chunk as the recorded `-p` prompt — a framing line followed by the serialized source-entry slice, fenced between `BEGIN/END` markers to prevent the model from treating the transcript as a live conversation. The observer calls its `record_observations` terminal tool to emit a list of observations, then shuts down.
+
+The minimal observation schema is:
+
+```typescript
+// From src/ledger/types.ts
+type Observation = {
+  timestamp: string;   // "YYYY-MM-DDTHH:MM:SS[.NN]" — orchestrator-assigned id+time
+  content: string;     // single-line plain prose
+  tokenCount: number;  // computed in code, not by the model
+};
+```
+
+The observer model emits `{ timestamp, content }` pairs at minute resolution. The orchestrator re-derives a precise, unique id-timestamp at commit time — anchored to the chunk's source-entry time span and disambiguated with a `.01`, `.02`, … suffix when two observations resolve to the same second. `tokenCount` is computed by the orchestrator; the model never produces it. The timestamp doubles as the observation's id.
+
+When observations arrive, the orchestrator appends them to the master ledger:
+
+```typescript
+pi.appendEntry("om.observations.recorded", { observations, coversUpToId });
+```
+
+Because these are branch-local ledger entries with a `coversUpToId` watermark, they roll back correctly when you navigate to an earlier point with `/tree`.
+
+---
+
+## Stage 3: Compaction
+
+Compaction fires on `agent_end` when context usage reaches `compactAtContextTokens` (default 150,000 tokens). The trigger calls `ctx.compact()`, which disconnects the agent loop; the `session_before_compact` hook then runs to produce the summary block.
+
+The hook is deterministic and model-free:
+
+1. **Snap the cutoff to a chunk boundary.** Pi proposes a `firstKeptEntryId` for the verbatim tail. The hook finds the nearest committed `coversUpToId` boundary whose resulting tail size is closest to `tailTokens` (default 20,000), so no chunk straddles the cutoff — nothing is both rendered into the summary and kept verbatim.
+
+2. **Wait check for in-flight observers.** If any in-flight observer has a chunk that ends before the cutoff, the hook waits for it to commit before rendering (so its observations are included). If all in-flight observers cover only chunks in the verbatim tail and the snap is already stable, the hook takes the fast path and skips the wait entirely.
+
+3. **Build the projection.** `buildCompactionProjection` collects all `om.observations.recorded` entries whose `coversUpToId` resolves at-or-before the cutoff. Observations whose source lies in the kept verbatim tail are excluded automatically.
+
+4. **Render the block.** The summary is rendered in three sections:
+
+```typescript
+// From src/ledger/render.ts
+export function renderSummary(
+  journey: string | undefined,
+  map: string | undefined,
+  observations: Observation[]
+): string
+```
+
+   - `## Journey` — the `JOURNEY.md` file read verbatim from disk
+   - Memory map — topic file summaries rendered from front-matter
+   - `## Observations` — chronological `YYYY-MM-DDTHH:MM:SS  content` lines
+
+The resulting compaction entry carries `details: { type: "om.folded", version: 1, observations }` so any future projection can read the folded observations back from the compaction entry.
+
+If a compaction fires mid-turn (with pending tool work), the extension automatically resumes the agent with a hidden `om.resume` custom message after the compaction completes, so the work continues transparently.
+
+---
+
+## Stage 4: Consolidator
+
+The consolidator clock runs on the same `turn_end` and `agent_start` events as the observer clock. It measures the total token count of the active observation pool (the live, un-tombstoned observations on the current branch). When that count reaches `consolidateAtPoolTokens` (default 15,000 tokens), the extension selects the oldest observations above `poolTargetTokens` (default 10,000 tokens) and promotes them.
+
+```typescript
+// From src/hooks/consolidator-trigger.ts
+const active = foldLedger(branch).activeObservations;
+if (poolTokens(active) < runtime.config.consolidateAtPoolTokens) return;
+
+const { promote } = selectPromotionOverflow(active, runtime.config.poolTargetTokens);
+```
+
+Exactly **one consolidator** runs at a time — `consolidatorInFlight` is a strict mutex. The consolidator subprocess receives a prompt containing the current INDEX.md, the current JOURNEY.md, and the overflow observations, then edits `.memory/<sessionId>/` files directly using its own scoped `read`/`write`/`edit`/`ls`/`grep` tools (it has no terminal tool; the run ends by natural exit).
+
+On clean exit (code 0), the orchestrator tombstones exactly the handed batch intersected with what is still active on the current branch:
+
+```typescript
+// Trust the consolidator: on clean exit it has folded (or discarded) everything we handed it.
+const stillActive = new Set(foldLedger(branch).activeObservations.map((o) => o.timestamp));
+const toDrop = promote.map((o) => o.timestamp).filter((t) => stillActive.has(t));
+
+pi.appendEntry("om.observations.dropped", { observationTimestamps: toDrop, coversUpToId });
+```
+
+The intersection (`∩ stillActive`) is the safety invariant: an observation an observer committed *during* the consolidator run is not in the handed batch, so it is never tombstoned. This guarantees the buffer always drains without risking data loss.
+
+After each consolidation the orchestrator re-renders `INDEX.md` from topic front-matter so the live filesystem always reflects the current state.
+
+Topic files are scoped per session (`.memory/<sessionId>/`, keyed by the immutable session-header id). They are **not** rolled back by `/tree` — they track the session, not the branch. On a fork, the new session's memory directory is seeded once from the parent's on first touch.
+
+---
+
+## Stage 5: JOURNEY.md
+
+`JOURNEY.md` is a special file alongside the topic files under `.memory/<sessionId>/`. It holds a single, whole-project, purely descriptive prose narrative of how the work reached its current state. Its sole purpose is **orientation** — not recall, not instruction, not planning.
+
+The consolidator appends a short dated segment for each consolidation run, narrating the arc of the promoted (aging-out) batch. This means the journey trails the live buffer by approximately `poolTargetTokens` worth of history, giving a clean, non-overlapping chronology. The consolidator prompt includes strict anti-steering instructions: no recommendations, next steps, TODOs, plans, advice, predictions, or evaluative judgement. Strictly past-tense descriptive prose only.
+
+The file grows via append-mostly semantics, compressing only when it exceeds `journeyTargetTokens`:
+
+- **Recent history**: detailed, segment-by-segment
+- **Distant past**: compressed into a tighter lead summary once the file grows past `journeyTargetTokens` (default 1,000 tokens)
+
+At every compaction the current `JOURNEY.md` is read verbatim from disk and rendered as the first section of the compaction block (`## Journey`), before the memory map and observations. This makes it a model-free, throwaway render of a durable file — it cannot decay incrementally.
+
+Like topic files, `JOURNEY.md` does **not** roll back under `/tree`. It is file-backed, shared across branches of the same session, and excluded from `listTopics` and the memory map.
+
+---
+
+## /tree correctness note
+
+<Note>
+  **Short-term and long-term tiers have different rollback semantics.**
+
+  The ledger-backed observation buffer (short-term tier) is branch-local: navigating to an earlier branch point with `/tree` replays only the `om.observations.recorded` and `om.observations.dropped` entries that were committed at-or-before that point, so the folded buffer correctly reflects the history of that branch. This is the same mechanism that makes all pi session state `/tree`-correct.
+
+  The `.memory/<sessionId>/` topic files and `JOURNEY.md` (long-term tier) are **not** rolled back. They are plain files on disk, scoped by session id but not by branch. If you `/tree` past a consolidation run, the promoted observations re-appear in the active buffer (they are no longer tombstoned), but the topic files still contain the consolidated content. The consolidator will deduplicate on its next run. This cross-tier state is a known, accepted design trade-off.
+
+  The `om.cost` ledger entries are also exempt from rollback: they are summed across all entries in the session (all branches) so real money spent never decreases under `/tree`.
+</Note>
+
+---
+
+<CardGroup cols={2}>
+  <Card title="Architecture Overview" icon="sitemap" href="/architecture/overview">
+    Detailed diagrams of the subprocess topology, ledger entry types, and runtime state machine.
+  </Card>
+  <Card title="Configuration Guide" icon="sliders" href="/guides/configuration">
+    All configuration keys, their defaults, and tuning guidance for different model sizes and session lengths.
+  </Card>
+</CardGroup>

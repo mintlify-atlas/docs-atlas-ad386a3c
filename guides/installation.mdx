@@ -1,0 +1,125 @@
+---
+title: "Installing Pi Observational Memory as a pi extension"
+sidebarTitle: "Installation"
+description: "Clone the repo, run npm install, and register Pi Observational Memory as a global or project-local pi extension. Default-off, so global registration is safe."
+---
+
+Pi Observational Memory is distributed as source and loaded directly by pi's extension system. There is no separate npm publish step — you clone the repository, install its dev dependencies, and point pi at the entry file. Because the extension is **off by default in every session**, registering it globally adds no overhead to projects that never enable it.
+
+## Prerequisites
+
+- **Node.js ≥ 18** — required for native ESM support and `AbortController`.
+- **pi coding agent** with extension support — the `ExtensionAPI` type and the `"pi"` field discovery mechanism must be present in your pi installation.
+
+## Clone and install
+
+<Steps>
+
+<Step title="Clone the repository">
+
+```bash
+git clone https://github.com/amosblomqvist/pi-observational-memory
+cd pi-observational-memory
+```
+
+</Step>
+
+<Step title="Install dependencies">
+
+```bash
+npm install
+```
+
+All runtime imports come from `peerDependencies`. The `package.json` lists them as `devDependencies` too so local type-checking and tests work out of the box:
+
+```json title="package.json (peer + dev)"
+"peerDependencies": {
+  "@earendil-works/pi-agent-core": "*",
+  "@earendil-works/pi-ai": "*",
+  "@earendil-works/pi-coding-agent": "*",
+  "@earendil-works/pi-tui": "*"
+}
+```
+
+These packages are **already present inside your pi installation** and are resolved at runtime from pi's module graph — you do not need to install them separately unless you are running tests outside of pi.
+
+</Step>
+
+</Steps>
+
+## How pi discovers extensions
+
+Pi reads the `"pi"` field in `package.json` to find an extension's entry point. Pi Observational Memory declares:
+
+```json title="package.json"
+{
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
+```
+
+Pi loads `./src/index.ts` directly (TypeScript, via pi's built-in ts-node-equivalent loader) and calls the default export, passing an `ExtensionAPI` instance. No build step is required before registration.
+
+## Register as a global extension
+
+A global extension is available in every pi session on the machine. Add the absolute path to this repo to your pi global extensions list.
+
+<Tabs>
+<Tab title="extensions.json">
+
+Edit (or create) `~/.pi/agent/extensions.json` and add an entry for the package directory:
+
+```json title="~/.pi/agent/extensions.json"
+[
+  "/absolute/path/to/pi-observational-memory"
+]
+```
+
+Pi resolves the `"pi".extensions` array from `package.json` relative to this directory path, so it will load `./src/index.ts`.
+
+</Tab>
+<Tab title="Manual symlink (alternative)">
+
+Some pi setups scan a directory for extension packages. If yours does, symlinking the repo into that directory has the same effect:
+
+```bash
+ln -s /absolute/path/to/pi-observational-memory ~/.pi/agent/extensions/observational-memory
+```
+
+Consult your pi version's extension-discovery documentation for the exact expected layout.
+
+</Tab>
+</Tabs>
+
+## Register as a project-local extension
+
+A project-local extension is only loaded when pi is started inside a specific project directory. Add the path to `.pi/extensions.json` at your project root:
+
+```json title="<project>/.pi/extensions.json"
+[
+  "/absolute/path/to/pi-observational-memory"
+]
+```
+
+Project-local extensions are loaded in addition to global ones. If you register the extension both globally and locally, pi deduplicates by package name (`"observational-memory"`).
+
+## Development workflow
+
+Once installed, two scripts cover the full development loop:
+
+```bash
+# Run the test suite (vitest)
+npm test
+
+# Type-check without emitting (tsc --noEmit)
+npm run typecheck
+```
+
+Tests live alongside the source in `src/` and use vitest's native TypeScript support. The typecheck script validates the full project including the `agent/` worker code.
+
+<Note>
+The extension is **off by default in every session** — registering it globally is safe and has zero impact on any session that hasn't run `/om on`. Every trigger, hook, and subprocess guard returns immediately when the gate is off.
+</Note>

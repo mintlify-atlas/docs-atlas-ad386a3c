@@ -1,0 +1,111 @@
+---
+title: "Long-term memory: topic files and JOURNEY.md"
+sidebarTitle: "Long-Term Memory"
+description: "How .memory/<sessionId>/ is laid out, what topic files and JOURNEY.md contain, how INDEX.md is maintained, and how fork seeding works."
+---
+
+Long-term memory in Pi Observational Memory is the durable tier that outlives any individual context window. Unlike the short-term observation buffer — which is branch-local and rolls back with `/tree` — the files in `.memory/<sessionId>/` track the project repository, not the session branch. They persist across compactions, resumptions, and branch rewrites, and are accessible to the master agent as ordinary files via `ls`, `read`, and `grep`.
+
+## File layout
+
+```
+<project>/
+  .memory/
+    <sessionId>/
+      INDEX.md                      # orchestrator-owned, rendered from topic front-matter
+      <topic>.md                    # consolidator-authored, YAML front-matter + prose body
+      JOURNEY.md                    # consolidator-authored, append-mostly narrative
+      .runs/
+        <runId>.result.json         # transient observer IPC (observation output)
+        <runId>.cost.json           # transient cost IPC (worker spend)
+```
+
+The `.memory/` base lives at the project root. Everything below it is scoped to `<sessionId>` — the immutable session-header UUID assigned when the session is first created. This id survives `/name`, `/resume`, and `/tree`; it is not the session filename UUID or the display name. Two sessions in the same project therefore never share consolidator output.
+
+## Topic files
+
+Each topic file is a Markdown document authored and maintained by the consolidator subprocess. The file name is a short slug chosen by the consolidator (e.g. `auth.md`, `database-schema.md`).
+
+**Front-matter:** every topic file begins with a YAML front-matter block:
+
+```markdown title=".memory/<sessionId>/auth.md"
+---
+id: auth
+title: Authentication System
+summary: JWT-based auth with refresh token rotation; sessions stored in Redis.
+updated: 2025-01-15T14:22:00
+---
+
+The authentication layer uses short-lived JWTs (15 min) paired with rotating refresh tokens
+stored in Redis with a 7-day TTL. Logout invalidates the refresh token immediately by deleting
+its Redis key. Password hashing uses bcrypt with cost factor 12...
+```
+
+The front-matter fields are:
+
+<ResponseField name="id" type="string">
+  Short, stable identifier for this topic. Used by the orchestrator when rendering `INDEX.md`.
+</ResponseField>
+<ResponseField name="title" type="string">
+  Human-readable title displayed in `INDEX.md` and in the compaction block's memory map.
+</ResponseField>
+<ResponseField name="summary" type="string">
+  One-sentence summary. This is what appears in `INDEX.md` — the master agent reads summaries to decide which topic files to open in full.
+</ResponseField>
+<ResponseField name="updated" type="string">
+  ISO 8601 timestamp of the last write, authored by the consolidator from the current local time string.
+</ResponseField>
+
+The **body** below the front-matter is free-form prose written and rewritten by the consolidator. It is a current-state description: the consolidator may merge new observations into an existing file, rewrite sections, or create a new file for a new topic area. Old content is replaced, not appended — topic files represent present state, not history.
+
+## INDEX.md
+
+`INDEX.md` is a special file owned by the orchestrator, not the consolidator. After each successful consolidator run, the orchestrator regenerates it from the front-matter of all topic files in the session directory.
+
+The master agent uses `INDEX.md` as the entry point to long-term memory: it can `ls` the directory to find files, or `grep` `INDEX.md` for a summary overview, then `read` specific topic files in full when it needs detail.
+
+```markdown title=".memory/<sessionId>/INDEX.md"
+# Memory Index
+
+| File | Title | Summary |
+|------|-------|---------|
+| auth.md | Authentication System | JWT-based auth with refresh token rotation... |
+| database-schema.md | Database Schema | PostgreSQL schema for the main application... |
+```
+
+Because `INDEX.md` is regenerated atomically (temp + rename) after each consolidator run, the master always sees a consistent view — never a partially-written index.
+
+## JOURNEY.md
+
+`JOURNEY.md` is the single whole-project narrative. Unlike topic files, it does not represent current state — it records how the project got here. The consolidator appends a short dated segment to it on every run, describing what changed in the batch of observations it just processed.
+
+**Compression:** once `JOURNEY.md` exceeds `journeyTargetTokens` (default 1,000 tokens), the consolidator compresses its oldest entries while preserving the most recent history in detail. This keeps the file bounded without losing the overall arc of the project.
+
+**In compaction blocks:** every time compaction fires, `JOURNEY.md` is read verbatim and included in the rendered compaction block. This gives the model orientation context — an understanding of project history — without requiring it to search through topic files.
+
+`JOURNEY.md` is purely descriptive: no instructions, no next steps, no advice. The consolidator is specifically prompted to write only factual history.
+
+## Per-session scoping
+
+Sessions are isolated by the **session-header id** — the immutable UUID written into the first line of the session file when it is created. This id is distinct from:
+
+- The **session filename** (which may be a different UUID and can diverge from the header id).
+- The **display name** (which `/name` can change at any time).
+
+Because the memory root is keyed by the immutable header id, two sessions working in the same project directory maintain separate topic files and separate `JOURNEY.md` histories. They do not contaminate each other's long-term recall.
+
+## Fork and clone seeding
+
+When a new session is created from an existing one (via fork, clone, or new-with-parent), its short-term ledger already carries the parent's observation entries. To match the long-term tier, the extension **seeds** the new session's `.memory/<sessionId>/` directory from the parent's on first touch.
+
+Seeding is handled by `ensureSessionMemory`:
+
+1. If `.memory/<sessionId>/` already exists (e.g. on resume), return it untouched — seeding never runs twice.
+2. If a parent session is recorded in the session header and its memory directory exists, copy the parent's entire `.memory/<parentSessionId>/` into `.memory/<sessionId>/` via an atomic temp + rename to avoid partially-seeded state. The `.runs/` IPC subdirectory is excluded.
+3. If there is no parent, the directory is **not** pre-created — the first durable write (topic file, `INDEX.md`, `JOURNEY.md`) creates it lazily.
+
+Seeding is idempotent: once the directory exists it is never re-seeded. This means `/resume` and `/tree` never disturb an already-existing memory directory.
+
+<Note>
+  `.runs/` files (`.result.json` and `.cost.json`) are transient IPC between the orchestrator and worker subprocesses. They are not garbage-collected in v1 — the directory accumulates one pair of files per worker run. They are excluded from fork seeding. Each file's name includes the run id (e.g. `obs-20250115142200-12345-1.result.json`), so there are no name collisions.
+</Note>

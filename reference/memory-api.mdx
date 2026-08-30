@@ -1,0 +1,213 @@
+---
+title: "Memory API: paths, topic files, and session scoping"
+sidebarTitle: "Memory API"
+description: "The .memory/ path helpers, topic file parsing, atomic write, and session seeding functions used by the consolidator and compaction hook."
+---
+
+The memory module (`src/memory/`) provides path resolution, file I/O, topic parsing, INDEX rendering, and session seeding for long-term memory. The `.memory/` directory is the durable tier: it is not rolled back by `/tree` because it tracks the repository, not the session branch. Two sessions in the same project each get their own scoped sub-directory under `.memory/`, so consolidator output from one session never overwrites another's.
+
+## Constants
+
+Two filename constants identify the special orchestrator-owned files inside a session memory root. Both are excluded from `listTopics` and handled separately by the compaction hook.
+
+```typescript
+export const INDEX_FILENAME   = "INDEX.md";
+export const JOURNEY_FILENAME = "JOURNEY.md";
+```
+
+`INDEX.md` is re-rendered by the orchestrator after every consolidation pass; it is never written by the consolidator model directly. `JOURNEY.md` is consolidator-authored prose — the running descriptive project history pushed verbatim into every compaction injection block.
+
+## Path functions
+
+All path helpers are pure functions that construct or read filesystem paths. They take absolute `cwd` or `root` strings and return absolute paths.
+
+### `memoryBaseDir(cwd)`
+
+Returns the project-level `.memory/` base directory. All session roots live one level below it.
+
+```typescript
+function memoryBaseDir(cwd: string): string
+// e.g. "/home/user/myproject/.memory"
+```
+
+### `sessionMemoryRoot(cwd, sessionId)`
+
+Returns the per-session memory root at `<project>/.memory/<sessionId>/`. All durable output (INDEX, topic files, JOURNEY) and transient `.runs/` IPC are scoped here. The `sessionId` is the immutable session-header UUID — it survives `/name`, `/resume`, and `/tree`, unlike the session filename UUID or the display name.
+
+```typescript
+function sessionMemoryRoot(cwd: string, sessionId: string): string
+// e.g. "/home/user/myproject/.memory/abc123/"
+```
+
+### `indexPath(root)`
+
+Returns the absolute path to `INDEX.md` inside a session memory root.
+
+```typescript
+function indexPath(root: string): string
+```
+
+### `journeyPath(root)`
+
+Returns the absolute path to `JOURNEY.md` inside a session memory root.
+
+```typescript
+function journeyPath(root: string): string
+```
+
+### `readJourney(root)`
+
+Reads and trims the contents of `JOURNEY.md` in the given session root. Returns `undefined` when the file is missing, unreadable, or empty after trimming. The compaction hook passes the return value directly to `renderSummary`.
+
+```typescript
+function readJourney(root: string): string | undefined
+```
+
+### `resolveWithinMemory(root, requestedPath)`
+
+Resolves `requestedPath` relative to `root` and verifies the result stays inside the session memory root. Returns the absolute resolved path, or `undefined` if the path would escape (e.g. via `../..`). The consolidator's scoped file tools call this on every path argument to prevent directory traversal.
+
+```typescript
+function resolveWithinMemory(root: string, requestedPath: string): string | undefined
+```
+
+<Warning>
+  Any consolidator tool that reads or writes files must call `resolveWithinMemory` and reject requests where it returns `undefined`. This is the primary guard against the consolidator writing outside `.memory/`.
+</Warning>
+
+## `atomicWrite(path, content)`
+
+Writes `content` to `path` via a temp-file and atomic rename. Creates all parent directories as needed. Readers never observe a half-written file because the rename is atomic on all POSIX filesystems.
+
+```typescript
+function atomicWrite(path: string, content: string): void
+```
+
+<Note>
+  All durable writes in the memory module — INDEX, JOURNEY, and topic files — go through `atomicWrite`. The same pattern is used in `src/spawn/runs.ts` for worker IPC files.
+</Note>
+
+## Topic types
+
+Topic files are ordinary Markdown files under the session memory root, authored by the consolidator model. Each file carries a small YAML front-matter block that the orchestrator parses for the memory map.
+
+```typescript
+type TopicFrontMatter = {
+  id?:      string;
+  title?:   string;
+  summary?: string;
+  updated?: string;
+};
+
+type Topic = TopicFrontMatter & {
+  /** Relative to the project cwd — e.g. ".memory/<sessionId>/auth.md" */
+  path:     string;
+  /** Bare filename — e.g. "auth.md" */
+  filename: string;
+};
+```
+
+A typical consolidator-authored topic file looks like:
+
+```markdown title=".memory/<sessionId>/auth.md"
+---
+id: auth
+title: Authentication system
+summary: OAuth2 flow using clerk; JWT validation in middleware.
+updated: 2025-06-01
+---
+
+## Current state
+
+The project uses Clerk for OAuth2. JWTs are validated in `src/middleware/auth.ts`...
+```
+
+## `parseFrontMatter(content)`
+
+Parses the leading `--- ... ---` block from topic file content. Supports the four flat fields the consolidator authors (`id`, `title`, `summary`, `updated`). Unrecognised keys are ignored. Quote-wrapped values are unquoted. Returns the parsed fields and the body text after the front-matter block.
+
+```typescript
+function parseFrontMatter(content: string): {
+  front: TopicFrontMatter;
+  body:  string;
+}
+```
+
+The parser is intentionally minimal — no YAML library dependency. It handles only simple `key: value` lines, which is all the consolidator prompt produces.
+
+## `listTopics(root)`
+
+Lists every `*.md` file in the session memory root except `INDEX.md` and `JOURNEY.md`, parses their front-matter, and returns a `Topic[]` sorted by filename. Each topic's `path` is rendered relative to the project `cwd` so the master agent can `read` or `grep` it directly from the memory map.
+
+```typescript
+function listTopics(root: string): Topic[]
+```
+
+Returns an empty array when the session root does not exist. Read errors on individual files are silently skipped — the topic is omitted rather than throwing.
+
+## `renderMemoryMap(topics)`
+
+Renders the memory map section of the compaction injection block from a `Topic[]`. Each entry is a single line: `` `path` — summary (updated …) ``. Returns `undefined` when `topics` is empty so `renderSummary` can omit the section entirely.
+
+```typescript
+function renderMemoryMap(topics: Topic[]): string | undefined
+```
+
+The return value is passed directly as the `map` argument to `renderSummary` (from `src/ledger/render.ts`). It is never written to disk — it is rebuilt live from disk at each compaction so the in-context view always matches the current topic files.
+
+## `ensureSessionMemory(ctx)`
+
+Resolves this session's `.memory/<sessionId>/` root and, on first touch, seeds it from the parent session if one exists. Returns the absolute root path. Idempotent: once the directory exists it is returned unchanged without re-seeding.
+
+```typescript
+type SessionCtx = {
+  cwd: string;
+  sessionManager: {
+    getSessionId: () => string;
+    getHeader?: () => {
+      id?: string;
+      cwd?: string;
+      parentSession?: string;
+    } | null | undefined;
+  };
+};
+
+function ensureSessionMemory(ctx: SessionCtx): string
+```
+
+Seeding copies the parent's memory root (minus the transient `.runs/` directory) via a temp-directory + rename so a concurrent reader never sees a half-seeded directory. If seeding fails, cleanup is best-effort and the function still returns the (unseeded) root path.
+
+<Tip>
+  Call `ensureSessionMemory` once during session startup (e.g. in the `session_start` hook) or lazily when the memory root is first needed. The first durable write (`atomicWrite`) creates the directory itself, so calling `ensureSessionMemory` is only strictly required when you need the root path before any write has occurred.
+</Tip>
+
+## Putting it together: rendering a compaction block
+
+The following example shows how the memory module's path and rendering functions combine with the ledger's `renderSummary` to produce the full injection block written into a compaction entry.
+
+```typescript title="src/hooks/compaction-hook.ts (simplified)"
+import { readJourney, listTopics, sessionMemoryRoot } from "../memory/paths.js";
+import { renderMemoryMap }                            from "../memory/index-render.js";
+import { renderSummary }                              from "../ledger/render.js";
+import { buildCompactionProjection }                  from "../ledger/projection.js";
+
+function buildCompactionBlock(
+  branch: Entry[],
+  firstKeptEntryId: string,
+  cwd: string,
+  sessionId: string,
+): string {
+  const root = sessionMemoryRoot(cwd, sessionId);
+
+  // 1. Read durable long-term state from disk
+  const journey = readJourney(root);
+  const topics  = listTopics(root);
+  const map     = renderMemoryMap(topics);
+
+  // 2. Select the active observation buffer up to the compaction cutoff
+  const { observations } = buildCompactionProjection(branch, firstKeptEntryId);
+
+  // 3. Combine into the injection block
+  return renderSummary(journey, map, observations);
+}
+```

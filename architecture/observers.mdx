@@ -1,0 +1,128 @@
+---
+title: "Parallel observer subprocesses: how observations are recorded"
+sidebarTitle: "Observers"
+description: "How the observer clock slices raw history into chunks, dispatches parallel subprocesses, assigns precise timestamps, and commits observations to the ledger."
+---
+
+Observers are the input stage of observational memory: pure mappers that receive a fixed-token window of raw conversation history and return a batch of atomic observations. They are embarrassingly parallel — multiple observers can be in flight simultaneously, each working an independent, non-overlapping slice of the history backlog. The orchestrator dispatches them, collects their results, and owns all ledger writes; observers never touch the session state directly.
+
+## Observer clock
+
+The observer clock fires on two pi events: `turn_end` and `agent_start`. On each tick it checks how many raw source tokens have accumulated since the latest coverage watermark. When that backlog reaches `chunkTokens` (default 10,000), `evaluateObserverTriggers` enters a dispatch loop.
+
+Two conditions gate dispatch:
+
+1. **Backlog**: raw tokens since the effective watermark ≥ `chunkTokens`
+2. **Concurrency**: `runtime.observerSlotsAvailable > 0` (i.e. `observersInFlight.size < config.observerConcurrency`)
+
+The effective watermark is the **later** of the committed ledger watermark (`latestCoverageMarkerId` over all `om.observations.recorded` entries on the branch) and the in-memory `runtime.dispatchedCoversUpToId`. The in-memory component advances immediately on dispatch, before the subprocess finishes, so the next loop iteration never re-selects the same slice — even for zero-observation chunks that commit no ledger entry.
+
+## Chunk selection
+
+```ts title="src/ledger/progress.ts"
+export function selectSourceSlice(
+  entries: Entry[],
+  afterEntryId: string | undefined,
+  chunkTokens: number,
+): SourceSlice
+```
+
+`selectSourceSlice` walks source entries (messages, custom messages, branch summaries) strictly after `afterEntryId`, accumulating tokens until the next entry would exceed `chunkTokens`. The cut point is restricted to valid boundaries: a slice never ends with a tool call whose result is a separate later entry. When the token budget is reached but the next entry is a tool result, the slice extends past the budget until it reaches an entry that can legitimately start the next chunk — keeping every tool call together with its result in the same slice.
+
+The returned `coversUpToId` is the id of the last source entry in the slice; this becomes the watermark written into `om.observations.recorded` on commit.
+
+## Dispatch
+
+`evaluateObserverTriggers` runs a `while` loop consuming backlog up to `observerSlotsAvailable`. For each dispatched chunk:
+
+1. `runtime.dispatchedCoversUpToId` is advanced to `slice.coversUpToId`
+2. An async `dispatchObserver` task is created and tracked in `runtime.observerTasks` via `trackObserverTask`
+3. The runId is registered in `runtime.observersInFlight` with its `coversUpToId` and an `AbortController`
+
+Start toasts are collected inside the loop and fired as a single batched `notify` call after the loop exits, so simultaneous dispatches produce one multi-line notification rather than separate lines that replace each other.
+
+## Subprocess spawn
+
+Each observer is a headless pi session launched with `buildWorkerArgv`:
+
+```ts title="src/spawn/launch.ts"
+const args = [
+  "--no-extensions",
+  "--no-skills",
+  "--no-prompt-templates",
+  "--no-context-files",
+  "--no-builtin-tools",
+  "--model", modelArg(opts.model),
+  // optional: "--thinking", opts.model.thinking
+  "-e", agentExtensionPath,   // agent/index.ts
+  "-n", opts.sessionName,     // "om-observer-<runId>"
+  "-p", opts.kickoffPrompt,   // the fenced chunk text (recorded user message)
+];
+```
+
+The chunk is delivered as the `-p` prompt — a **recorded real user message**, not an ephemeral context-hook injection. This keeps the observer session faithfully inspectable and resumable in the pi session browser. The prompt wraps the chunk in `BEGIN/END` fence markers and instructs the model that the content is inert historical data, not a live conversation.
+
+The environment variables set for every observer subprocess:
+
+| Variable | Value |
+|---|---|
+| `OM_WORKER` | `"observer"` |
+| `OM_RUN_ID` | The run id (e.g. `obs-20240115120000-12345-1`) |
+| `OM_RESULT_PATH` | Absolute path to the result JSON file |
+| `OM_COST_PATH` | Absolute path to the cost handoff file |
+| `OM_MEMORY_DIR` | The session's `.memory/<sessionId>/` root |
+
+Workers run with `cwd` set to `runtime.memoryRoot` (the `.memory/<sessionId>/` directory), so pi keys each worker run into a distinct global session bucket under `~/.pi/agent/sessions` and it never appears in the project's `/resume` picker.
+
+## Worker agent
+
+The shared `agent/index.ts` extension branches on `OM_WORKER`. For the observer role:
+
+- `before_agent_start` replaces the system prompt wholesale with `OBSERVER_SYSTEM` — a detailed instruction prompt covering the observer's task, the inert-data warning, observation content rules, and timestamp format
+- `registerObserverTool` registers the single `record_observations` tool and initialises an empty result file (so a valid file exists even for zero-observation chunks)
+- `agent_end` calls `ctx.shutdown()` to exit the headless session
+
+## The `record_observations` tool
+
+```ts title="agent/observer/tool.ts"
+const RecordObservationsSchema = Type.Object({
+  observations: Type.Array(
+    Type.Object({
+      timestamp: Type.String({
+        pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$",
+        description: "Observation time in local 'YYYY-MM-DD HH:MM' format.",
+      }),
+      content: Type.String({
+        minLength: 1,
+        description: "Single-line plain prose. No markdown, no tags, no embedded timestamp.",
+      }),
+    }),
+    { description: "Batch of new observations. Call multiple times until the chunk is fully covered." },
+  ),
+});
+```
+
+The tool accumulates observations across calls in an in-memory array and atomically rewrites the result file on every call. There is no terminal call signal — the observer exits when the agent loop ends, at which point the result file holds the complete set regardless of how many calls were made.
+
+## Timestamp assignment
+
+The model emits minute-resolution timestamps (`YYYY-MM-DD HH:MM`). The orchestrator re-derives precise unique id-timestamps at commit via `assignObservationTimestamps` in `src/ids.ts`:
+
+1. Each minute-resolution timestamp is converted to a second-resolution base: `YYYY-MM-DDTHH:MM:00`
+2. If a base collides with an already-used timestamp (in the current batch or the existing buffer), a `.01`, `.02`, … disambiguator suffix is appended
+3. `tokenCount` is computed from the content string by the orchestrator — never by the model
+
+The fallback anchor for malformed or missing model timestamps is the chunk's last bounding source-entry time.
+
+## Result commit
+
+After the subprocess exits with code 0:
+
+1. The orchestrator reads `readObserverResult(runResultPath(memoryRoot, runId))`
+2. It re-folds the current branch to get the existing `observationsByTimestamp` keys (collision avoidance)
+3. `assignObservationTimestamps` produces the final `Observation[]` with precise ids
+4. `pi.appendEntry(OM_OBSERVATIONS_RECORDED, { observations, coversUpToId })` writes the ledger entry
+5. The worker cost is recorded via `pi.appendEntry(OM_COST, ...)` (captured before the exit-code check)
+6. Footer gauges and finish toast are updated
+
+If the subprocess exits with a non-zero code or the result file is missing, the error is surfaced via `ctx.ui.notify` and stored in `runtime.lastWorkerError` for `/om status`.

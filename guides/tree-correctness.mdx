@@ -1,0 +1,85 @@
+---
+title: "Memory correctness under /tree navigation"
+sidebarTitle: "/tree Correctness"
+description: "Which memory rolls back when you branch with /tree, which doesn't, and how the on/off gate, cost tracking, and passive mode behave across branches."
+---
+
+Pi's `/tree` command lets you create a new branch from any past point in the session history, effectively rewinding and replaying from a different decision. Pi Observational Memory is designed to stay correct on every branch — short-term observations track the branch, while long-term files track the repository. Understanding this split is important for reasoning about what a post-rewind session knows.
+
+## Short-term (ledger) rollback
+
+The observation buffer lives in the branch-local ledger. Every `om.observations.recorded` and `om.observations.dropped` entry is a custom ledger event with a `coversUpToId` — a pointer to the last source entry whose raw history is summarized by that observation batch.
+
+When pi's `/tree` creates a branch from a past position, it constructs a new branch that diverges at that point. The extension folds the ledger from the branch root up to the current branch tip:
+
+```typescript
+// foldLedger replays only entries present in the current branch
+const folded = foldLedger(branch);
+```
+
+Because the fold operates on `branch` — the branch-local entry list — any observations recorded on the original branch after the divergence point simply do not appear on the new branch. The observation buffer shrinks to reflect only the work done up to the rewind point, and then re-grows as new observers fire on the new branch.
+
+**Drop tombstones are also branch-local.** An `om.observations.dropped` entry only tombstones observations when both the observation and the drop entry are present in the folded branch. If you rewind past a consolidation, the tombstones written by that consolidator run disappear from the branch, and the observations they dropped re-appear in the active buffer.
+
+## Long-term (`.memory/` files) — not rolled back
+
+Topic files (`<topic>.md`), `INDEX.md`, and `JOURNEY.md` in `.memory/<sessionId>/` are **not** branch-aware. They are plain files on disk, written by the consolidator subprocess after it processes a batch of observations. Pi's `/tree` does not revert filesystem writes.
+
+If you rewind past a consolidation that promoted observations into topic files:
+
+1. Those observations re-appear in the active buffer (their tombstones are no longer in the branch).
+2. The topic files still contain the consolidated content from that run.
+3. The next consolidation run will receive those re-active observations again and is expected to re-file or deduplicate them. The consolidator is instructed to merge and rewrite — refiling already-present information is a valid, safe outcome.
+
+This design is intentional: topic files and `JOURNEY.md` are durable cross-session records that belong to the project repository, not to any single branch. Reversing them would destroy knowledge that may be valuable regardless of which branch you are now on.
+
+<Warning>
+  Long-term files do **not** roll back after `/tree`. After a rewind past a consolidation, previously-promoted observations re-enter the active buffer and will be handed to the consolidator again on its next run. The consolidator handles this by merging or deduplicating, but the topic file content from the rolled-back consolidation remains on disk until overwritten.
+</Warning>
+
+## `om.enabled` gate — per-branch
+
+The on/off gate is stored as an `om.enabled` ledger entry. Because it lives in the branch-local ledger, it rolls back with `/tree` correctly: switching to a branch restores the exact gate state that was set on that branch.
+
+If you ran `/om on` on the original branch, rewound to before that command, and started a new branch without re-running `/om on`, the new branch starts with the gate off. The gate state on the original branch is unaffected.
+
+## `om.cost` — summed across all branches, never rolls back
+
+Cost is explicitly exempt from the branch-local rollback rule. The `sumSessionCost` function reads from `getEntries()` — all entries across all branches — not from the current `getBranch()`:
+
+```typescript
+// From src/ledger/types.ts
+export function sumSessionCost(allEntries: Entry[]): { costUsd: number; runs: number } {
+  // Counts every om.cost entry in the entire session, not just the current branch
+}
+```
+
+This means the footer and `/om:status` always show the **highest accurate** total spend. Real money cannot be unspent when you rewind a branch.
+
+## Testing with `passive` mode
+
+Automatic triggers (observer dispatch, consolidation, auto-compaction) can interfere with controlled `/tree` testing by firing observers on branches you intend to inspect in a quiescent state. Set `PI_OM_PASSIVE=1` to disable all triggers for a session without changing the gate state or ledger:
+
+```bash
+PI_OM_PASSIVE=1 pi
+```
+
+With `passive` mode active, no observer subprocesses are dispatched on `turn_end` or `agent_start`, no consolidation runs, and no automatic compaction fires. Manual commands (`/om:compact`, `/om:consolidate`) still work if you want to test those paths explicitly.
+
+`passive` is a process-level override — it takes precedence over the `passive` key in `settings.json` and is the recommended way to freeze background activity during branch navigation tests.
+
+## Summary
+
+<CardGroup cols={2}>
+  <Card title="Rolls back with /tree" icon="rotate-left">
+    - Active observation buffer (`om.observations.recorded`)
+    - Consolidation tombstones (`om.observations.dropped`)
+    - On/off gate state (`om.enabled`)
+  </Card>
+  <Card title="Does not roll back" icon="lock">
+    - Topic files (`.memory/<sessionId>/<topic>.md`)
+    - Memory index (`INDEX.md`)
+    - Project narrative (`JOURNEY.md`)
+    - Session cost total (`om.cost`)
+  </Card>
+</CardGroup>

@@ -1,0 +1,134 @@
+---
+title: "Deterministic compaction: rendering the memory block"
+sidebarTitle: "Compaction"
+description: "How the compaction trigger fires, the hook snaps the cutoff to a chunk boundary, builds the observation projection, and renders the deterministic three-section memory block."
+---
+
+Compaction in observational memory is entirely model-free. When pi's context window fills up, the orchestrator's `session_before_compact` hook intercepts the operation, snaps the cutoff to a chunk boundary, waits for in-flight observers when necessary, and renders the summary block deterministically from the observation buffer and on-disk long-term memory. No model is invoked; the rendered block is a pure function of durable state.
+
+## Trigger
+
+```ts title="src/hooks/compaction-trigger.ts"
+pi.on("turn_end", (event, ctx) => {
+  if (!runtime.enabled || runtime.config.passive) return;
+  if (runtime.compactInFlight) return;
+  if (!contextPressureTokens(ctx, runtime.config.compactAtContextTokens).due) return;
+  // ...
+  ctx.compact({ onComplete, onError });
+});
+```
+
+The trigger fires on `turn_end` (not `agent_end`) so compaction can interrupt a running agent between turns rather than waiting for the whole run to complete. Live context usage is checked first via `ctx.getContextUsage()`, falling back to `rawTokensSinceLastCompaction` when the live count is unavailable. When the threshold is crossed, `ctx.compact()` is called immediately — the observer idle-wait happens inside the `session_before_compact` hook, after pi has already paused the chat.
+
+The trigger skips compaction when pi's retryable-error pattern matches the turn's `errorMessage`, so transient provider errors do not trigger a compaction between auto-retry attempts.
+
+## Mid-run auto-resume
+
+When compaction fires during a turn that has pending tool work (i.e. the turn was not the run's terminal turn), the orchestrator can automatically resume the agent after compaction completes. Whether to resume is decided **before** `ctx.compact()` is called, from the current turn's event, because ctx state at `onComplete` (post-abort, post-reload) no longer reflects whether the turn had pending work.
+
+```ts
+const shouldResume = runtime.config.resumeAfterMidRunCompaction && turnWillContinue(event);
+// ...
+onComplete: () => {
+  if (!shouldResume || !runtime.enabled || runtime.config.passive) return;
+  pi.sendMessage(
+    { customType: OM_RESUME, content: RESUME_PROMPT, display: false },
+    { triggerTurn: true },
+  );
+}
+```
+
+A `turn_end` that is the run's terminal turn (no pending tool results) is left to stop, exactly as if no compaction had happened.
+
+## Hook
+
+The `session_before_compact` hook (`registerCompactionHook`) does the substantive work. It is guarded by `runtime.compactHookInFlight` to prevent re-entrant calls:
+
+<Note>
+The `compactHookInFlight` flag is set at hook entry and cleared in the `finally` block. If a duplicate `session_before_compact` fires while one is already in progress, the hook returns `{ cancel: true }` immediately and emits a warning.
+</Note>
+
+<Steps>
+  <Step title="Compute snap">
+    Read the current branch and call `snapCutoff(branch, firstKeptEntryId, tailTokens)`. This finds all chunk boundaries (the distinct `coversUpToId` indices of committed `om.observations.recorded` entries), identifies the first source entry after each boundary that is a valid cut point, and picks the boundary whose resulting verbatim tail is closest to `tailTokens`. The snap ensures no observation chunk straddles the compaction cutoff — every chunk either falls entirely in the summary or entirely in the verbatim tail.
+  </Step>
+
+  <Step title="Evaluate fast path">
+    Call `canSkipObserverWait(branch, snap.firstKeptId, snap.tail, tailTokens, runtime.observersInFlight.values())`.
+
+    Two conditions must both hold to skip the wait:
+    1. The snapped tail is already `<= tailTokens` (the snap is stable — no further observer commit could produce a better snap)
+    2. Every in-flight observer has a `coversUpToId` that resolves at or after the cutoff (no in-flight chunk can affect the projection)
+
+    If either condition fails, the hook waits for `runtime.whenObserversIdle()`, then re-reads the branch and recomputes the snap against the now-settled ledger.
+  </Step>
+
+  <Step title="Build projection">
+    ```ts
+    const projection = buildCompactionProjection(branch, snapped.firstKeptId);
+    ```
+
+    `buildCompactionProjection` folds active observations whose `coversUpToId` resolves **strictly before** `firstKeptEntryId` (the `beforeEntry` boundary). Observations whose coverage falls in the verbatim tail are excluded automatically. The result also carries a `details` blob (`{ type: "om.folded", version: 1, observations }`) stamped into the compaction entry so future `visibleProjection` calls can read it back without replaying the full branch.
+  </Step>
+
+  <Step title="Read long-term memory">
+    ```ts
+    const journey = readJourney(runtime.memoryRoot);
+    const map = renderMemoryMap(listTopics(runtime.memoryRoot));
+    ```
+
+    Both reads are live from disk — regenerated fresh on every compaction. The journey is `.memory/<sessionId>/JOURNEY.md` read verbatim. The map is rendered from topic file front-matter (`id`, `title`, `summary`, `updated`). Neither can decay through incremental editing because they are always rebuilt from the authoritative source.
+  </Step>
+
+  <Step title="Render summary">
+    ```ts
+    const summary = renderSummary(journey, map, projection.observations);
+    ```
+
+    The final block is returned to pi as `{ compaction: { summary, firstKeptEntryId: snapped, tokensBefore, details } }`.
+  </Step>
+</Steps>
+
+## Block structure
+
+The rendered compaction block follows a fixed three-section layout:
+
+```
+These are condensed memories from earlier in this session.
+
+- Journey: a short, purely descriptive history of how this work reached its current state …
+- Observations: timestamped events from the conversation history, in chronological order.
+
+Treat these as past records. …
+
+## Journey
+<verbatim JOURNEY.md content>
+
+## Memory
+<memory map rendered from topic front-matter>
+
+## Observations
+YYYY-MM-DDTHH:MM:SS  <content>
+YYYY-MM-DDTHH:MM:SS  <content>
+…
+```
+
+Each observation line is formatted as `observationToLine(observation)`: timestamp, two spaces, content. Observations are sorted chronologically by their timestamp-id (lexicographic order equals chronological order). The `## Memory` section is omitted when no topic files exist; `## Journey` is omitted when JOURNEY.md is missing or empty; `## Observations` is omitted when the projection is empty.
+
+## `details` stamp
+
+The `details` field on the compaction entry is set to the `MemoryDetails` blob from the projection:
+
+```ts
+type MemoryDetails = {
+  type: "om.folded";
+  version: 1;
+  observations: Observation[];
+};
+```
+
+This lets `visibleProjection` — used when a session is opened fresh without a specific `upToEntryId` — read the folded observations directly from the most recent compaction entry rather than replaying the full branch history.
+
+<Tip>
+`tailTokens` (default 20,000) and `compactAtContextTokens` (default 150,000) have the biggest impact on compaction behaviour per model. A larger `tailTokens` keeps more raw history verbatim after the cutoff, which is useful for models that benefit from seeing recent tool calls in full. A lower `compactAtContextTokens` compacts more aggressively, trading verbatim tail for a larger rendered observation window. Both can be set per-project in `.pi/settings.json` under the `observational-memory` key.
+</Tip>

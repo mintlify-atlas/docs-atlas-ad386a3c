@@ -1,0 +1,92 @@
+---
+title: "Tracking worker costs in Pi Observational Memory"
+sidebarTitle: "Cost Tracking"
+description: "How observer and consolidator subprocess costs are captured via pi's built-in metrics, stored as om.cost ledger entries, and surfaced in the footer and /om:status."
+---
+
+Every worker in Pi Observational Memory — observers and the consolidator — is an ordinary pi subprocess session. Pi tracks model spend natively in each session via `usage.cost.total`. The extension captures that figure after each worker exits and folds it into the master session's ledger, where it accumulates monotonically across the full session tree.
+
+## How cost is captured
+
+Each worker subprocess includes the extension's worker-side code (`agent/index.ts`). When the worker's session shuts down, that code reads `usage.cost.total` from pi's built-in metrics and writes it to a small JSON file in the session's `.runs/` directory:
+
+```
+.memory/<sessionId>/.runs/<runId>.cost.json
+```
+
+The file contains a single field:
+
+```json title="<runId>.cost.json"
+{ "costUsd": 0.00042 }
+```
+
+After `spawnWorker` returns, the orchestrator reads this cost file (best-effort — it does not throw on missing or malformed input) and, if a cost is found, appends an `om.cost` entry to the master session ledger:
+
+```typescript
+// From src/hooks/observer-trigger.ts
+const cost = readWorkerCost(runCostPath(runtime.memoryRoot, runId));
+if (!cost) return;
+pi.appendEntry(OM_COST, { costUsd: cost.costUsd, role, runId });
+```
+
+This cost recording happens **before** the exit-code check, so a worker that produced observations but then exited non-zero still has its spend captured.
+
+## The `om.cost` ledger entry
+
+Each finished worker appends one `om.cost` entry to the master ledger:
+
+```typescript
+// CostEntryData shape from src/ledger/types.ts
+{
+  costUsd: number,         // USD spend for this worker run
+  role: "observer" | "consolidator",
+  runId: string            // e.g. "obs-20250115142200-12345-1"
+}
+```
+
+The `role` field distinguishes observer spend from consolidator spend, though in practice the running total is what matters for budget awareness.
+
+## Why cost is summed across all branches
+
+The running total is computed by summing **every** `om.cost` entry across the whole session, not just the current branch:
+
+```typescript
+// From src/ledger/types.ts
+export function sumSessionCost(allEntries: Entry[]): { costUsd: number; runs: number } {
+  // allEntries comes from getEntries() — all branches — not getBranch()
+  ...
+}
+```
+
+This is intentional. Under `/tree` navigation, switching to a different branch does not reverse real money that was spent. A worker that ran on a discarded branch still incurred API charges. Summing across all branches ensures the displayed total accurately reflects total spend, never appearing to decrease when you rewind or switch branches.
+
+## Where cost is surfaced
+
+<CardGroup cols={2}>
+  <Card title="Footer gauge" icon="gauge">
+    A `$0.0000` display appears to the right of the observation buffer gauges in the pi TUI footer. It updates after each worker completes and on session resume.
+  </Card>
+  <Card title="/om:status" icon="terminal">
+    The status command prints `session cost: $X.XXXX (N runs)` where N is the total number of finished worker runs across all branches.
+  </Card>
+</CardGroup>
+
+Cost display is formatted to four decimal places (`$0.0023`) to be meaningful for small per-chunk observer runs, which typically cost fractions of a cent each.
+
+## Ephemeral-safe design
+
+The cost handoff does not depend on the worker session being persisted. Because spend is written to a standalone `.cost.json` file (not inside the session log), it is captured and forwarded to the master ledger even if pi's session persistence is disabled or the worker session file is lost. The orchestrator reads the cost file immediately after the subprocess exits, while the file is guaranteed to be present.
+
+## Cost on resume
+
+The running total is recomputed from the ledger on every `session_start` event:
+
+```typescript
+runtime.refreshCost(ctx.sessionManager.getEntries() as Entry[]);
+```
+
+Because `om.cost` entries persist in the session log across restarts, the total is correctly restored on any resume — even after a process restart or machine reboot.
+
+<Note>
+  Session cost accumulates across the **entire session tree**, including all `/tree` branches. This means the footer and `/om:status` always show the highest-possible accurate spend figure — it can only increase, never decrease, as long as workers are running.
+</Note>

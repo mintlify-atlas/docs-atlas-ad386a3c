@@ -1,0 +1,162 @@
+---
+title: "Configuring observer and consolidator models"
+sidebarTitle: "Models"
+description: "How to specify provider, model id, and thinking level for the observer and consolidator workers — including default models, role-appropriate thinking levels, and cost trade-offs."
+---
+
+Both the observer and the consolidator run as headless pi subprocess sessions. Because they are full pi sessions, each can be independently pointed at any provider and model that pi supports. Their model configuration lives under the `models` key in the `observational-memory` namespace and is the primary lever for balancing quality, throughput, and cost across the memory pipeline.
+
+## Model object schema
+
+Each role — `observer` and `consolidator` — takes a model object with the following fields:
+
+<ParamField body="provider" type="string" required>
+  The model provider key as recognised by pi (for example `"anthropic"`, `"openrouter"`,
+  `"openai"`). The value must match a provider that is configured and credentialled in your pi
+  installation.
+</ParamField>
+
+<ParamField body="id" type="string" required>
+  The model identifier as recognised by pi for the given provider (for example
+  `"claude-sonnet-4-5"`, `"z-ai/glm-5.3"`, `"gpt-4o"`). The exact string passed here is
+  forwarded to pi when the subprocess session is launched.
+</ParamField>
+
+<ParamField body="thinking" type="string">
+  Optional thinking level for the model. Controls how much extended reasoning the model
+  applies before producing output. Must be one of:
+
+  | Level | Description |
+  |---|---|
+  | `"off"` | No extended thinking; fastest and cheapest |
+  | `"minimal"` | Minimal reasoning budget |
+  | `"low"` | Light reasoning; suitable for extraction tasks |
+  | `"medium"` | Moderate reasoning; suitable for routing and synthesis |
+  | `"high"` | Deep reasoning |
+  | `"xhigh"` | Maximum reasoning budget |
+
+  If omitted, the value from the built-in defaults for that role is used.
+</ParamField>
+
+## Default models
+
+The built-in defaults from `src/config.ts` are:
+
+```jsonc
+{
+  "observational-memory": {
+    "models": {
+      "observer":     { "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "low" },
+      "consolidator": { "provider": "openrouter", "id": "z-ai/glm-5.3", "thinking": "medium" }
+    }
+  }
+}
+```
+
+The two roles use different thinking levels by default (`"low"` for observers, `"medium"` for
+the consolidator) because their tasks have different quality and throughput requirements —
+observers are pure, high-volume extractors while the consolidator performs topic routing and
+synthesis that benefits from more careful reasoning.
+
+## Thinking levels by role
+
+**Observers** run `"thinking": "low"` by default. An observer's task is pure extraction: read
+a fixed-token chunk of raw conversation history and call `record_observations` with the atomic
+events it contains. This is a well-structured mapping task with a narrow output format.
+Extended reasoning adds latency and cost but little accuracy benefit once the model is capable
+enough to follow the extraction rules reliably.
+
+**The consolidator** runs `"thinking": "medium"` by default. The consolidator must decide
+how to route each incoming observation across existing and new topic files, rewrite topic
+content to reflect superseded facts, and maintain the `JOURNEY.md` narrative with the right
+level of compression. These tasks involve more judgement — whether to merge or split topics,
+which old facts to retire, how to condense the journey history — so a moderate reasoning
+budget improves output quality at manageable cost.
+
+<Note>
+  Observers fire once every `chunkTokens` of new raw history (default 10,000 tokens), and up
+  to `observerConcurrency` (default 4) may run in parallel. In a long session, dozens of
+  observer runs accumulate. The observer model's per-token cost scales directly with session
+  length, so a cheap, fast model is appropriate once you have validated it handles your
+  conversation style correctly.
+</Note>
+
+## Examples
+
+### Switch both roles to Anthropic
+
+```jsonc title=".pi/settings.json"
+{
+  "observational-memory": {
+    "models": {
+      "observer": {
+        "provider": "anthropic",
+        "id": "claude-sonnet-4-5",
+        "thinking": "low"
+      },
+      "consolidator": {
+        "provider": "anthropic",
+        "id": "claude-sonnet-4-5",
+        "thinking": "medium"
+      }
+    }
+  }
+}
+```
+
+### Use a cheap model for observers, stronger model for the consolidator
+
+Observers run frequently and have a narrow, well-defined task; the consolidator runs less
+often and benefits from stronger reasoning. Splitting the models reduces cost without
+compromising long-term memory quality:
+
+```jsonc title=".pi/settings.json"
+{
+  "observational-memory": {
+    "models": {
+      "observer": {
+        "provider": "openrouter",
+        "id": "z-ai/glm-5.3",
+        "thinking": "low"
+      },
+      "consolidator": {
+        "provider": "anthropic",
+        "id": "claude-sonnet-4-5",
+        "thinking": "medium"
+      }
+    }
+  }
+}
+```
+
+### Disable extended thinking on both roles
+
+If you are on a provider or model that does not support extended thinking, or you want
+maximum throughput, set `"thinking": "off"` explicitly:
+
+```jsonc title=".pi/settings.json"
+{
+  "observational-memory": {
+    "models": {
+      "observer":     { "provider": "openai", "id": "gpt-4o", "thinking": "off" },
+      "consolidator": { "provider": "openai", "id": "gpt-4o", "thinking": "off" }
+    }
+  }
+}
+```
+
+## Model object merging behaviour
+
+The `models` object is merged at the role level. If you specify `models.observer` in your
+project `.pi/settings.json`, the entire observer model object from your file replaces the
+default — partial overrides (for example providing only `id` while expecting `provider` to
+stay at the default) are not supported. Always supply all required fields (`provider` and `id`)
+together.
+
+<Tip>
+  Worker sessions are ordinary recorded pi sessions stored in `~/.pi/agent/sessions` under
+  the project path. You can open them in the session browser to inspect the exact input chunk,
+  tool calls, and token usage for each observer or consolidator run — useful for auditing
+  model quality and understanding spend. See the [cost tracking guide](/guides/cost-tracking)
+  for details on how spend is accumulated and surfaced.
+</Tip>

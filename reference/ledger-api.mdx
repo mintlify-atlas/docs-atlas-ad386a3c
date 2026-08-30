@@ -1,0 +1,322 @@
+---
+title: "Ledger API: entry types, fold, and projection functions"
+sidebarTitle: "Ledger API"
+description: "TypeScript types, constants, and pure functions exported from the ledger module for reading and writing the observation ledger."
+---
+
+The ledger module (`src/ledger/`) provides the types, constants, and pure functions for reading and writing the observation ledger. Every piece of short-term memory — observations recorded by workers, tombstones applied by the consolidator, cost records, compaction details — flows through these types. The module is entirely model-free: it contains no I/O, no subprocess calls, and no side effects, making its functions safe to call from any extension hook.
+
+## Entry type constants
+
+Six string constants name the custom entry types that observational memory writes into the pi ledger. Import them from `src/ledger/types.ts` (or the barrel `src/ledger/index.ts`) and compare against `entry.customType` when scanning branch entries.
+
+```typescript
+export const OM_OBSERVATIONS_RECORDED = "om.observations.recorded";
+export const OM_OBSERVATIONS_DROPPED  = "om.observations.dropped";
+export const OM_FOLDED                = "om.folded";
+export const OM_ENABLED               = "om.enabled";
+export const OM_COST                  = "om.cost";
+export const OM_RESUME                = "om.resume";
+```
+
+<CardGroup cols={2}>
+  <Card title="OM_OBSERVATIONS_RECORDED" icon="circle-plus">
+    Observer output committed by the orchestrator into the buffer tier after a successful worker run.
+  </Card>
+  <Card title="OM_OBSERVATIONS_DROPPED" icon="circle-minus">
+    Promotion tombstones written by the orchestrator after a consolidator run (Phase B), keyed by observation timestamp.
+  </Card>
+  <Card title="OM_FOLDED" icon="layer-group">
+    The `details` type stamped into a compaction entry so future projections can replay the observation set without re-folding the full branch.
+  </Card>
+  <Card title="OM_ENABLED" icon="toggle-on">
+    Per-session on/off gate state. Default is OFF; `/om on` appends this entry to arm the triggers.
+  </Card>
+  <Card title="OM_COST" icon="circle-dollar-sign">
+    Per-worker cost record (one per finished run). Accumulated across the whole session so spend never rolls back under `/tree`.
+  </Card>
+  <Card title="OM_RESUME" icon="rotate-right">
+    Synthetic continuation message injected after a mid-run compaction. Carried as a `role: "custom"` entry with `display: false`.
+  </Card>
+</CardGroup>
+
+## Core types
+
+### `Observation`
+
+The minimal unit of distilled memory. `timestamp` is the orchestrator-assigned second-resolution id — it doubles as the primary key and is guaranteed unique across all observations in a session. `tokenCount` is computed by the orchestrator at commit; the model never sets it.
+
+```typescript
+type Observation = {
+  timestamp: string;   // "YYYY-MM-DDTHH:MM:SS[.NN]" — unique id
+  content:   string;   // single-line plain prose, no newlines
+  tokenCount: number;  // orchestrator-computed char-based estimate
+};
+```
+
+### `ObservationsRecordedEntryData`
+
+The `data` field of an `om.observations.recorded` custom ledger entry. `coversUpToId` is the branch entry id of the last source entry in the observer's chunk — the coverage watermark used to advance the observer clock.
+
+```typescript
+type ObservationsRecordedEntryData = {
+  observations:  Observation[];
+  coversUpToId:  string;
+};
+```
+
+### `ObservationsDroppedEntryData`
+
+The `data` field of an `om.observations.dropped` custom ledger entry. Lists the `timestamp` ids of observations promoted to durable topic files, plus the `coversUpToId` watermark that advances the drop clock.
+
+```typescript
+type ObservationsDroppedEntryData = {
+  observationTimestamps: string[];
+  coversUpToId:          string;
+};
+```
+
+### `CostEntryData`
+
+The `data` field of an `om.cost` custom ledger entry. One entry is written per finished worker run. `role` distinguishes observer spend from consolidator spend; `runId` correlates with the result file under `.memory/.runs/`.
+
+```typescript
+type CostEntryData = {
+  costUsd: number;
+  role:    "observer" | "consolidator";
+  runId:   string;
+};
+```
+
+### `MemoryDetails`
+
+Stamped into the compaction entry's `details` field. A future `visibleProjection` call reads it back to reconstruct the observation set without re-folding the entire branch — essential for `/tree` time-travel correctness.
+
+```typescript
+type MemoryDetails = {
+  type:         typeof OM_FOLDED;  // "om.folded"
+  version:      1;
+  observations: Observation[];
+};
+```
+
+## Guard functions
+
+Each guard is a TypeScript type predicate that validates the runtime shape of an entry or value. Use them when iterating branch entries from `getBranch()` to avoid trusting the raw `unknown` data field.
+
+<Accordion title="isObservation(value)">
+  Returns `true` when `value` is a non-null object with a non-empty `timestamp` string, a single-line non-empty `content` string (no `\r` or `\n`), and a finite non-negative `tokenCount` number.
+
+  ```typescript
+  function isObservation(value: unknown): value is Observation
+  ```
+</Accordion>
+
+<Accordion title="isObservationsRecordedEntry(entry)">
+  Returns `true` when `entry.type === "custom"`, `entry.customType === OM_OBSERVATIONS_RECORDED`, and `entry.data` is a valid `ObservationsRecordedEntryData` with at least one observation.
+
+  ```typescript
+  function isObservationsRecordedEntry(entry: Entry): entry is Entry & {
+    type:       "custom";
+    customType: typeof OM_OBSERVATIONS_RECORDED;
+    data:       ObservationsRecordedEntryData;
+  }
+  ```
+</Accordion>
+
+<Accordion title="isObservationsDroppedEntry(entry)">
+  Returns `true` when `entry.type === "custom"`, `entry.customType === OM_OBSERVATIONS_DROPPED`, and `entry.data` has a non-empty `observationTimestamps` array and a non-empty `coversUpToId`.
+
+  ```typescript
+  function isObservationsDroppedEntry(entry: Entry): entry is Entry & {
+    type:       "custom";
+    customType: typeof OM_OBSERVATIONS_DROPPED;
+    data:       ObservationsDroppedEntryData;
+  }
+  ```
+</Accordion>
+
+<Accordion title="isCostEntry(entry)">
+  Returns `true` when `entry.customType === OM_COST` and `entry.data.costUsd` is a finite, non-negative number.
+
+  ```typescript
+  function isCostEntry(entry: Entry): entry is Entry & {
+    type:       "custom";
+    customType: typeof OM_COST;
+    data:       CostEntryData;
+  }
+  ```
+</Accordion>
+
+<Accordion title="isMemoryDetails(value)">
+  Returns `true` when `value` has `type === OM_FOLDED`, `version === 1`, and an `observations` array whose every element passes `isObservation`.
+
+  ```typescript
+  function isMemoryDetails(value: unknown): value is MemoryDetails
+  ```
+</Accordion>
+
+## Builder functions
+
+Builder functions produce validated `data` payloads for `pi.appendEntry()` calls. They return `undefined` when inputs are empty or invalid, so callers can skip the append without a separate guard.
+
+### `buildObservationsRecordedData`
+
+Constructs the data payload for an `om.observations.recorded` entry. Returns `undefined` if `observations` is empty or `coversUpToId` is blank.
+
+```typescript
+function buildObservationsRecordedData(
+  observations:  Observation[],
+  coversUpToId:  string,
+): ObservationsRecordedEntryData | undefined
+```
+
+### `buildObservationsDroppedData`
+
+Constructs the data payload for an `om.observations.dropped` entry. Returns `undefined` if `observationTimestamps` is empty or `coversUpToId` is blank.
+
+```typescript
+function buildObservationsDroppedData(
+  observationTimestamps: string[],
+  coversUpToId:          string,
+): ObservationsDroppedEntryData | undefined
+```
+
+## `sumSessionCost(allEntries)`
+
+Sums every `om.cost` entry across the whole session and returns the total spend plus the number of worker runs that contributed.
+
+```typescript
+function sumSessionCost(allEntries: Entry[]): { costUsd: number; runs: number }
+```
+
+<Warning>
+  Pass `sessionManager.getEntries()` (all entries across every branch), **not** `getBranch()`. Because each branch carries its own cost records, scanning only the current branch would undercount spend whenever `/tree` navigates to an older branch. The whole-session scan is what makes the displayed cost monotonic.
+</Warning>
+
+## `foldLedger(entries, options?)`
+
+Folds the branch entries into a live view of the observation buffer. Applies first-valid-record-wins semantics keyed by timestamp-id, then applies tombstones from all `om.observations.dropped` entries within the fold boundary.
+
+```typescript
+type FoldLedgerOptions = {
+  /** Fold through this entry id, inclusive. Omit to fold through the branch tip. */
+  upToEntryId?: string;
+};
+
+type FoldedLedger = {
+  observations:                Observation[];        // all recorded, including tombstoned
+  activeObservations:          Observation[];        // live injected buffer (drops applied)
+  droppedObservationTimestamps: Set<string>;         // all tombstoned timestamps
+  observationsByTimestamp:     Map<string, Observation>; // keyed by timestamp-id
+};
+
+function foldLedger(entries: Entry[], options?: FoldLedgerOptions): FoldedLedger
+```
+
+Use `activeObservations` to read the current live buffer. Use `observationsByTimestamp.keys()` as the `used` set when assigning timestamps to a new batch of raw observations (see [`assignObservationTimestamps`](#assignobservationtimestamps-rawobs-options)).
+
+<Note>
+  `foldLedger` is branch-local: short-term memory naturally rolls back under `/tree` because the fold only covers the supplied branch path.
+</Note>
+
+## `buildCompactionProjection(entries, firstKeptEntryId)`
+
+Builds the deterministic compaction projection: the set of active observations covered strictly before `firstKeptEntryId`, plus the `MemoryDetails` blob stamped into the compaction entry.
+
+```typescript
+type CompactionProjection = {
+  observations: Observation[];
+  details:      MemoryDetails;
+};
+
+function buildCompactionProjection(
+  entries:          Entry[],
+  firstKeptEntryId: string,
+): CompactionProjection
+```
+
+`firstKeptEntryId` is the first verbatim entry kept in the compaction's tail. Observations whose source coverage falls inside that tail are excluded — they belong to the verbatim context, not the rendered block. The `details` field is written into the compaction entry so `visibleProjection` can restore the observation set on a fresh session load without re-folding the full history.
+
+## `renderSummary(journey, map, observations)`
+
+Produces the full compaction injection block string: a context usage instructions header, optionally a Journey section, optionally a memory map section, and an Observations section. All three are model-free renders of durable state and are regenerated from scratch each compaction.
+
+```typescript
+function renderSummary(
+  journey:      string | undefined,
+  map:          string | undefined,
+  observations: Observation[],
+): string
+```
+
+Observations are sorted chronologically by timestamp before rendering. Each line takes the form `"YYYY-MM-DDTHH:MM:SS  content"`. Returns an empty string when all three inputs are empty or undefined.
+
+## Progress functions
+
+Three utility functions measure buffer and context progress against configured thresholds. All operate on a branch array from `getBranch()`.
+
+### `rawTokensSinceObservationCoverage(branch)`
+
+Returns the estimated raw-history token count accumulated since the latest `om.observations.recorded` coverage watermark on the branch. The observer trigger compares this against `config.chunkTokens` to decide whether to dispatch a new observer.
+
+```typescript
+function rawTokensSinceObservationCoverage(entries: Entry[]): number
+```
+
+### `latestCoverageMarkerId(branch, entryType)`
+
+Returns the `coversUpToId` value from the most recent valid coverage entry of the given type (`OM_OBSERVATIONS_RECORDED` or `OM_OBSERVATIONS_DROPPED`), resolving "most recent" by branch index of the covered entry. Returns `undefined` when no valid coverage entry exists.
+
+```typescript
+function latestCoverageMarkerId(
+  entries:    Entry[],
+  customType: MemoryCustomType,
+): string | undefined
+```
+
+### `poolTokens(observations)`
+
+Sums the `tokenCount` field of an array of observations. Used by the runtime to compute the current pool size and compare against `config.consolidateAtPoolTokens`.
+
+```typescript
+function poolTokens(observations: Observation[]): number
+```
+
+## Usage example
+
+The following shows how an extension hook reads the active buffer without spawning any workers — useful for building a custom `/om:status` command or a debug inspector.
+
+```typescript title="my-extension/inspect-buffer.ts"
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  foldLedger,
+  poolTokens,
+  rawTokensSinceObservationCoverage,
+  OM_OBSERVATIONS_RECORDED,
+  latestCoverageMarkerId,
+} from "../src/ledger/index.js";
+
+export function registerBufferInspector(pi: ExtensionAPI): void {
+  pi.registerCommand("om:inspect", async (ctx) => {
+    const branch = ctx.sessionManager.getBranch();
+
+    // Fold the full branch into the active observation buffer
+    const { activeObservations, observationsByTimestamp } = foldLedger(branch);
+
+    const pool    = poolTokens(activeObservations);
+    const pending = rawTokensSinceObservationCoverage(branch);
+    const marker  = latestCoverageMarkerId(branch, OM_OBSERVATIONS_RECORDED);
+
+    pi.ui.showMarkdown([
+      `**Active observations:** ${activeObservations.length} (${pool} tokens)`,
+      `**Pending raw tokens:** ${pending}`,
+      `**Latest coverage marker:** ${marker ?? "(none)"}`,
+      "",
+      activeObservations
+        .map((o) => `- \`${o.timestamp}\` ${o.content}`)
+        .join("\n"),
+    ].join("\n"));
+  });
+}
+```

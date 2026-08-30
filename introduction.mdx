@@ -1,0 +1,87 @@
+---
+title: "Pi Observational Memory: tiered memory for pi"
+sidebarTitle: "Introduction"
+description: "Tiered, subprocess-backed memory for pi: parallel observers feed a branch-local ledger buffer; a consolidator promotes aging observations to durable topic files. Default OFF."
+---
+
+Pi Observational Memory is a TypeScript extension for the [pi coding agent](https://github.com/amosblomqvist/pi-observational-memory) that gives your pi sessions persistent, structured memory without disrupting normal workflow. It runs entirely as background subprocess activity — parallel observer processes distill raw conversation chunks into atomic observations, a branch-local ledger stores them correctly under `/tree`, and a consolidator drains the oldest observations into durable per-session topic files once the buffer grows large enough. The extension ships default-off so it is completely invisible until you explicitly enable it for a session.
+
+## The two-tier model
+
+The extension splits memory across two tiers with different durability and rollback behaviour:
+
+**Short-term tier — the ledger buffer.** Every `chunkTokens` of new raw conversation history, an observer subprocess cuts a fixed-token slice and distills it into atomic observations. Each observation is `{ timestamp, content, tokenCount }`. Observations are committed to the master session's branch-local ledger as `om.observations.recorded` entries with a `coversUpToId` watermark. Because they ride the ledger, observations roll back correctly when you use `/tree` to navigate to an earlier branch point — the short-term tier is `/tree`-correct by design.
+
+**Long-term tier — `.memory/<sessionId>/` files.** When the active observation pool exceeds `consolidateAtPoolTokens`, a single background consolidator subprocess promotes the oldest observations into durable topic Markdown files under `.memory/<sessionId>/`. These files are keyed by the immutable session-header id so two sessions in the same project never overwrite each other's output. Topic files are **not** rolled back by `/tree` — they track the session, not the branch. A fork or clone seeds its memory directory from the parent's on first touch, matching the ledger that already travels with the fork.
+
+At compaction the extension renders the full compaction block deterministically and model-free: JOURNEY.md orientation → memory map from topic front-matter → active observations buffer → verbatim raw tail. No model call is needed to render the block.
+
+## Default-off safety gate
+
+The extension ships in the global extensions folder and attaches to every pi session, but it is **gated off by default**. When the gate is off, every trigger, hook, TUI widget, and subprocess returns immediately — there is no footer, no ledger writes, and no subprocess activity.
+
+Enable it for the current session:
+
+```
+/om on
+```
+
+Toggle it:
+
+```
+/om
+```
+
+Disable it:
+
+```
+/om off
+```
+
+State is persisted in the ledger (`om.enabled` entries) so it survives session resume and `/tree` navigation within the same session lineage.
+
+## When to use it
+
+Pi Observational Memory is most valuable in long-running sessions where the raw conversation history is too large to keep entirely in the context window, and where you want the agent to stay oriented on what has already been done without needing to re-read the full transcript at every compaction. The observer → ledger → compaction pipeline ensures the agent always has a compact, chronologically accurate summary of recent activity, while the consolidator builds up a navigable, `grep`-able topic-file store that persists across sessions.
+
+It is less useful — and best left off — for short throwaway sessions, sessions involving highly sensitive data you do not want distilled into background subprocess calls, or when you are testing `/tree` branching behaviour in isolation (the `passive` config knob disables all triggers for exactly this purpose).
+
+## Features
+
+<CardGroup cols={2}>
+  <Card title="Branch-correct memory" icon="code-branch">
+    Observations live in the branch-local ledger and roll back correctly under `/tree`. Short-term memory always reflects the active branch.
+  </Card>
+  <Card title="Parallel observers" icon="arrow-right-arrow-left">
+    Multiple observer subprocesses run concurrently (capped by `observerConcurrency`), each covering its own fixed-token chunk. Out-of-order completion is safe — each carries its own `coversUpToId` watermark.
+  </Card>
+  <Card title="Durable topic files" icon="file-lines">
+    The consolidator writes clean current-state prose into `.memory/<sessionId>/<topic>.md` files. They survive session restart, are `grep`-able, and are seeded into fork sessions automatically.
+  </Card>
+  <Card title="Cost tracking" icon="chart-line">
+    Every worker is a recorded pi subprocess, so its spend is captured from pi's built-in `usage.cost.total`. The running total (`om.cost` ledger entries) never rolls back under `/tree` — real money spent does not decrease.
+  </Card>
+  <Card title="Fork seeding" icon="share-nodes">
+    When a new session forks from a parent, its `.memory/<sessionId>/` directory is seeded once from the parent's. The short-term ledger already travels with the fork; this keeps both tiers in sync.
+  </Card>
+  <Card title="JOURNEY.md orientation" icon="map">
+    A single `JOURNEY.md` file holds a running descriptive narrative of how the project reached its current state. It is pushed verbatim into every compaction block so the agent stays oriented even after a full context reset.
+  </Card>
+</CardGroup>
+
+## Peer dependency
+
+The extension depends on the pi coding agent packages as peer dependencies. You must have a working pi installation before installing this extension:
+
+```json title="package.json (peerDependencies)"
+{
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
+```
+
+These are declared as peer dependencies rather than direct dependencies so the extension shares the same pi runtime that is already installed globally, avoiding version conflicts.

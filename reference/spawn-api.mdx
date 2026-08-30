@@ -1,0 +1,267 @@
+---
+title: "Spawn API: launching and communicating with worker subprocesses"
+sidebarTitle: "Spawn API"
+description: "The functions for building argv, spawning headless pi workers, and reading result files written by observer and consolidator subprocesses."
+---
+
+The spawn module (`src/spawn/`) handles building the pi subprocess command line, running workers, and reading their result and cost files via filesystem IPC. Workers are ordinary headless `pi` sessions — not sub-agents — so every run is recorded in the global pi session store under the project path and is openable in the session browser. The chunk or observation batch is passed as the `-p` kickoff prompt rather than a context-hook injection, keeping each run faithfully inspectable on resume.
+
+## `buildWorkerArgv(options)`
+
+Builds the complete `argv` array for a pi worker subprocess. The binary is resolved from the current process's own entry point first, falling back to `pi` on PATH.
+
+```typescript
+function buildWorkerArgv(options: {
+  model:                ConfiguredModel;
+  sessionName:          string;
+  kickoffPrompt:        string;
+  agentExtensionPath?:  string;
+}): string[]
+```
+
+<ParamField path="model" type="ConfiguredModel" required>
+  The model configuration to pass to the worker. The `ConfiguredModel` interface carries three fields:
+
+  ```typescript
+  interface ConfiguredModel {
+    provider:  string;
+    id:        string;
+    thinking?: ModelThinkingLevel;
+  }
+  ```
+
+  `provider` and `id` are joined as `provider/id` and passed to `--model`. When `thinking` is set it is passed as `--thinking <level>`.
+</ParamField>
+
+<ParamField path="sessionName" type="string" required>
+  The `-n` session name for the worker run. Observers use `"om-observer-<runId>"`; the consolidator uses a similar pattern. This name appears in the pi session browser.
+</ParamField>
+
+<ParamField path="kickoffPrompt" type="string" required>
+  The `-p` headless prompt recorded as the first user message of the worker session. For observers this is the serialized conversation chunk; for the consolidator this is the observation batch to promote.
+</ParamField>
+
+<ParamField path="agentExtensionPath" type="string">
+  Path to the worker agent extension (`agent/index.ts`). Defaults to the `agent/` directory two levels above `src/spawn/launch.ts` in the installed package. Override for testing.
+</ParamField>
+
+The resulting argv passes `--no-extensions`, `--no-skills`, `--no-prompt-templates`, `--no-context-files`, and `--no-builtin-tools` so workers run in a clean environment with only the OM agent extension loaded.
+
+## `buildWorkerEnv(role, options)`
+
+Builds the subprocess environment, inheriting all current process env vars and overlaying the OM-specific IPC variables.
+
+```typescript
+function buildWorkerEnv(
+  role:    "observer" | "consolidator",
+  options: {
+    memoryRoot: string;  // absolute .memory/<sessionId>/ root
+    runId:      string;
+  },
+): NodeJS.ProcessEnv
+```
+
+The overlay variables set on every worker:
+
+| Variable | Value | Purpose |
+|---|---|---|
+| `OM_WORKER` | `"observer"` or `"consolidator"` | Tells the agent extension which role to activate |
+| `OM_RUN_ID` | The run id string | Correlates IPC files with the ledger entry |
+| `OM_RESULT_PATH` | `runResultPath(memoryRoot, runId)` | Where observers write their observations JSON |
+| `OM_COST_PATH` | `runCostPath(memoryRoot, runId)` | Where the extension writes the per-run cost |
+| `OM_MEMORY_DIR` | The session memory root | Sandbox root for consolidator file tools |
+
+<Note>
+  `OM_RESULT_PATH` is used by observers to write `{ observations: RawObservation[] }`. Consolidators do not write a result file — they write topic files directly into `OM_MEMORY_DIR` via the scoped file tools. Both roles write `OM_COST_PATH` via `writeWorkerCost`.
+</Note>
+
+## `spawnWorker(options)`
+
+Spawns the headless pi worker and resolves when the process exits.
+
+```typescript
+type WorkerExit = {
+  code:   number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+};
+
+function spawnWorker(options: {
+  argv:    string[];
+  cwd:     string;
+  env:     NodeJS.ProcessEnv;
+  signal?: AbortSignal;
+}): Promise<WorkerExit>
+```
+
+<ParamField path="argv" type="string[]" required>
+  The full argv array from `buildWorkerArgv`. The first element is the command; the rest are arguments passed to `child_process.spawn`.
+</ParamField>
+
+<ParamField path="cwd" type="string" required>
+  Working directory for the worker process. Pass the session memory root (`runtime.memoryRoot`) so pi keys the run into a distinct global session bucket, keeping it separate from the project's `/resume` picker. The directory is created with `mkdirSync` before spawning to avoid `ENOENT`.
+</ParamField>
+
+<ParamField path="env" type="NodeJS.ProcessEnv" required>
+  The environment from `buildWorkerEnv`. Passed verbatim to the child process.
+</ParamField>
+
+<ParamField path="signal" type="AbortSignal">
+  Optional abort signal. When aborted, the worker receives `SIGTERM` followed by `SIGKILL` after 3 seconds if it has not exited.
+</ParamField>
+
+The worker's stdout is suppressed (`"ignore"`); stderr is collected and returned in `WorkerExit.stderr`. A spawn error (e.g. binary not found) resolves with `{ code: 1, signal: null, stderr: "spawn error" }` rather than rejecting.
+
+## Result file functions
+
+All IPC between the orchestrator and workers flows through files under `<sessionRoot>/.runs/`. The orchestrator reads these files after the worker process has exited — never during.
+
+### `runResultPath(root, runId)`
+
+Returns the observer result file path: `<root>/.runs/<runId>.result.json`.
+
+```typescript
+function runResultPath(root: string, runId: string): string
+```
+
+### `runCostPath(root, runId)`
+
+Returns the per-run cost file path: `<root>/.runs/<runId>.cost.json`. Both observers and consolidators write here; the orchestrator reads it after exit to append an `om.cost` ledger entry.
+
+```typescript
+function runCostPath(root: string, runId: string): string
+```
+
+### `readObserverResult(path)`
+
+Reads and validates an observer result file. Returns `{ observations: RawObservation[] }` with any malformed observation objects silently filtered out. Throws when the file is missing, unparseable JSON, or lacks an `observations` array entirely.
+
+```typescript
+type ObserverRunResult = {
+  observations: RawObservation[];
+};
+
+function readObserverResult(path: string): ObserverRunResult
+```
+
+### `readWorkerCost(path)`
+
+Reads a cost file and returns `{ costUsd: number }`, or `undefined` on any missing/malformed input. Always call this even when the worker exited with a non-zero code — partial runs still incur spend.
+
+```typescript
+type WorkerCostResult = {
+  costUsd: number;
+};
+
+function readWorkerCost(path: string): WorkerCostResult | undefined
+```
+
+## `RawObservation` type
+
+The model-emitted, pre-processed observation shape. The model writes only `timestamp` (minute resolution) and `content`; `tokenCount` is never set by the model and does not exist on this type.
+
+```typescript
+type RawObservation = {
+  timestamp: string;  // "YYYY-MM-DD HH:MM" — minute resolution from model
+  content:   string;  // single-line plain prose
+};
+```
+
+The orchestrator promotes `RawObservation[]` to `Observation[]` via `assignObservationTimestamps` (see below) before committing to the ledger.
+
+## `assignObservationTimestamps(rawObs, options)`
+
+Promotes model-emitted `RawObservation[]` to ledger-ready `Observation[]` by deriving precise, unique second-resolution id-timestamps and computing `tokenCount` for each entry.
+
+```typescript
+type AssignTimestampsOptions = {
+  /** Already-used ids (from foldLedger's observationsByTimestamp.keys()). */
+  used?:           Iterable<string>;
+  /** Fallback anchor when a model timestamp is missing or malformed. */
+  fallbackAnchor?: number | string;
+};
+
+function assignObservationTimestamps(
+  modelObservations: RawObservation[],
+  options?:          AssignTimestampsOptions,
+): Observation[]
+```
+
+The conversion logic:
+
+1. Each `"YYYY-MM-DD HH:MM"` model timestamp is converted to `"YYYY-MM-DDTHH:MM:00"`.
+2. If the resulting base id is already in `used`, a deterministic `.01`, `.02`, … disambiguator is appended until the id is unique.
+3. The id is added to the `used` set, preventing collisions within the same batch.
+4. `tokenCount` is computed with the same `estimateStringTokens` heuristic used for all ledger accounting (≈ 4 chars per token).
+
+<Tip>
+  Pass `foldLedger(branch).observationsByTimestamp.keys()` as `used` to guarantee uniqueness across all previously recorded observations. Pass the last bounding source entry's `timestamp` as `fallbackAnchor` so observations from chunks that lack a model timestamp get a reasonable approximate id rather than the current wall-clock time.
+</Tip>
+
+## Full observer dispatch example
+
+The following TypeScript example shows the complete orchestrator sequence for dispatching one observer: selecting a source slice, building the prompt, spawning the worker, reading the result, and committing to the ledger.
+
+```typescript title="src/hooks/observer-trigger.ts (simplified)"
+import { foldLedger, selectSourceSlice, serializeSourceAddressedBranchEntries,
+         latestCoverageMarkerId, OM_OBSERVATIONS_RECORDED }    from "../ledger/index.js";
+import { buildWorkerArgv, buildWorkerEnv, spawnWorker }        from "../spawn/launch.js";
+import { readObserverResult, readWorkerCost,
+         runResultPath, runCostPath }                           from "../spawn/runs.js";
+import { assignObservationTimestamps }                         from "../ids.js";
+import type { ExtensionAPI }                                   from "@earendil-works/pi-coding-agent";
+import type { Runtime }                                        from "../runtime.js";
+
+async function dispatchObserver(
+  pi:      ExtensionAPI,
+  runtime: Runtime,
+  branch:  Entry[],
+): Promise<void> {
+  const runId = `obs-${Date.now()}-${process.pid}`;
+
+  // 1. Select the next uncovered source slice
+  const watermarkId = latestCoverageMarkerId(branch, OM_OBSERVATIONS_RECORDED);
+  const slice       = selectSourceSlice(branch, watermarkId, runtime.config.chunkTokens);
+  if (slice.entries.length === 0 || !slice.coversUpToId) return;
+
+  // 2. Serialize the slice into the kickoff prompt
+  const { text: chunkText } = serializeSourceAddressedBranchEntries(slice.entries);
+  const kickoffPrompt       = `Compress the chunk below into observations...\n\n${chunkText}`;
+
+  // 3. Build argv + env and spawn the worker
+  const argv = buildWorkerArgv({
+    model:         runtime.config.models.observer,
+    sessionName:   `om-observer-${runId}`,
+    kickoffPrompt,
+  });
+  const env  = buildWorkerEnv("observer", { memoryRoot: runtime.memoryRoot, runId });
+  const exit = await spawnWorker({ argv, cwd: runtime.memoryRoot, env });
+
+  // 4. Always read cost (even on failure)
+  const cost = readWorkerCost(runCostPath(runtime.memoryRoot, runId));
+  if (cost) {
+    pi.appendEntry("om.cost", { costUsd: cost.costUsd, role: "observer", runId });
+  }
+
+  if (exit.code !== 0) {
+    throw new Error(`observer exited ${exit.code}: ${exit.stderr.slice(0, 200)}`);
+  }
+
+  // 5. Read + validate the result file, then assign precise timestamp ids
+  const result       = readObserverResult(runResultPath(runtime.memoryRoot, runId));
+  const used         = foldLedger(branch).observationsByTimestamp.keys();
+  const lastEntry    = slice.entries.at(-1);
+  const observations = assignObservationTimestamps(result.observations, {
+    used,
+    fallbackAnchor: lastEntry?.timestamp,
+  });
+
+  // 6. Commit to the ledger
+  if (observations.length > 0) {
+    pi.appendEntry("om.observations.recorded", {
+      observations,
+      coversUpToId: slice.coversUpToId,
+    });
+  }
+}
+```

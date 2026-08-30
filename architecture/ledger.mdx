@@ -1,0 +1,133 @@
+---
+title: "The branch-local observation ledger"
+sidebarTitle: "Ledger"
+description: "How om.* custom entries store observations, tombstones, cost, and compaction state — including folding semantics, watermarks, and /tree-correct cost monotonicity."
+---
+
+The ledger is the authoritative short-term state store for observational memory. It is not a separate database — it is a sequence of pi **custom entries** written directly into the session transcript, each namespaced under `om.*`. Because pi's branch history is the storage medium, short-term memory rolls back natively when the user navigates with `/tree`. All reads and writes go through the orchestrator; worker subprocesses never touch the ledger directly.
+
+## Entry types
+
+<ParamField body="om.observations.recorded" type="custom entry">
+  Observer output committed by the orchestrator after a successful observer subprocess run.
+
+  ```ts
+  type ObservationsRecordedEntryData = {
+    observations: Observation[];
+    coversUpToId: string;
+  };
+  ```
+
+  `coversUpToId` is the id of the last source entry included in the observer's chunk — the coverage watermark that the observer clock advances past on the next tick.
+</ParamField>
+
+<ParamField body="om.observations.dropped" type="custom entry">
+  Promotion tombstones written by the orchestrator after a consolidator run completes cleanly.
+
+  ```ts
+  type ObservationsDroppedEntryData = {
+    observationTimestamps: string[];
+    coversUpToId: string;
+  };
+  ```
+
+  `observationTimestamps` lists the timestamp-ids of every observation in the handed batch that was still active at exit time. `coversUpToId` is anchored to the branch tip's last source entry at tombstone time.
+</ParamField>
+
+<ParamField body="om.enabled" type="custom entry">
+  Per-session on/off gate state. Written when the user runs `/om on` or `/om off`. The orchestrator defaults to `enabled: false` on every session start; there is no persistent on default.
+
+  ```ts
+  { enabled: boolean }
+  ```
+</ParamField>
+
+<ParamField body="om.cost" type="custom entry">
+  Per-worker cost record. One entry is appended for each finished observer or consolidator subprocess run, whether or not the run succeeded (cost is recorded before the exit-code check).
+
+  ```ts
+  type CostEntryData = {
+    costUsd: number;
+    role: "observer" | "consolidator";
+    runId: string;
+  };
+  ```
+
+  Cost is read from pi's built-in usage metrics via the worker's cost file at `<memoryRoot>/.runs/<runId>.cost.json`.
+</ParamField>
+
+<ParamField body="om.folded" type="compaction details">
+  Stamped into the `details` field of the pi compaction entry (not written as a standalone custom entry). Lets a future `visibleProjection` read back exactly which observations were folded at compaction time without replaying the full branch history.
+
+  ```ts
+  type MemoryDetails = {
+    type: "om.folded";
+    version: 1;
+    observations: Observation[];
+  };
+  ```
+</ParamField>
+
+<ParamField body="om.resume" type="custom entry">
+  Synthetic continuation message used to resume the agent loop after a mid-run compaction — a `turn_end` that was not the run's terminal turn. Delivered as a `role: "custom"` message with `display: false` so it is hidden from the human TUI; pi surfaces it to the model as a user-role turn.
+
+  ```ts
+  const RESUME_PROMPT =
+    "[automatic] Your context was just compacted to free space; no user message was sent. " +
+    "Continue exactly where you left off, as if the compaction had not happened.";
+  ```
+</ParamField>
+
+## Observation schema
+
+The minimal unit of short-term memory is an `Observation`:
+
+```ts title="src/ledger/types.ts"
+export type Observation = {
+  timestamp: string;   // "YYYY-MM-DDTHH:MM:SS[.NN]" — also the unique id
+  content: string;     // single-line plain prose
+  tokenCount: number;  // computed by the orchestrator, never by the model
+};
+```
+
+The `timestamp` field doubles as the observation's unique identifier. The model emits minute-resolution timestamps (`YYYY-MM-DD HH:MM`); the orchestrator promotes these to second-resolution `YYYY-MM-DDTHH:MM:SS` bases and appends `.01`, `.02`, … disambiguators when two observations resolve to the same second — either within a batch or against the existing buffer. See `src/ids.ts` for the full assignment logic.
+
+## Folding
+
+`foldLedger(entries, options?)` replays a branch's `om.observations.recorded` and `om.observations.dropped` entries in order to produce the live observation state:
+
+```ts title="src/ledger/fold.ts"
+export type FoldedLedger = {
+  observations: Observation[];              // all first-valid records, including dropped
+  activeObservations: Observation[];        // not tombstoned — the live buffer
+  droppedObservationTimestamps: Set<string>;
+  observationsByTimestamp: Map<string, Observation>;
+};
+```
+
+Key semantics:
+
+- **First-valid-record-wins** — if the same timestamp appears in two `om.observations.recorded` entries (e.g. after a `/tree` rewind that replays an earlier branch), only the first occurrence is kept.
+- **Tombstones are additive** — `om.observations.dropped` entries accumulate across the fold; a dropped timestamp suppresses any observation with that id, including ones not yet seen at drop time.
+- **Branch-scoped** — because the fold walks the branch returned by `getBranch()`, `/tree` navigation automatically rolls back short-term memory to the state that existed at that branch position.
+
+The optional `upToEntryId` argument folds only through a specific entry, which the compaction hook uses to build a projection at a historic cutoff point.
+
+## Watermarks
+
+Every `om.observations.recorded` and `om.observations.dropped` entry carries a `coversUpToId` — the id of the last source entry covered by that record. The observer clock uses the **latest resolved `coversUpToId`** across all committed `om.observations.recorded` entries as its advance marker; the dispatch loop tracks an in-memory `dispatchedCoversUpToId` on top of that so parallel observers never re-select the same slice.
+
+The projection logic uses the same watermarks to decide which observations fall before the compaction cutoff. An `om.observations.recorded` entry is included in a projection only when its `coversUpToId` resolves to a branch index **strictly before** `firstKeptEntryId` — the first entry kept verbatim in the compaction tail.
+
+## Cost monotonicity under `/tree`
+
+`sumSessionCost` deliberately sums `om.cost` entries across **all entries** returned by `getEntries()` (the full session history across all branches), not just the current branch from `getBranch()`. This guarantees that the displayed spend counter is monotonically non-decreasing: branching or rewinding with `/tree` never makes the cost number appear to shrink, because the spend on abandoned branches is still counted.
+
+```ts title="src/ledger/types.ts"
+/**
+ * Sum every `om.cost` entry across the WHOLE session. Callers MUST pass all entries
+ * (`getEntries()`), NOT a single branch (`getBranch()`): counting every branch is what makes
+ * real spend monotonic — it never decreases when /tree navigates onto another branch.
+ */
+export function sumSessionCost(allEntries: Entry[]): { costUsd: number; runs: number }
+```

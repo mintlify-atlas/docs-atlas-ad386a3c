@@ -1,0 +1,154 @@
+---
+title: "Pi Observational Memory slash commands reference"
+sidebarTitle: "Commands"
+description: "Complete reference for /om, /om:status, /om:compact, and /om:consolidate — what each command does, its output fields, and when it is a no-op."
+---
+
+Pi Observational Memory exposes four slash commands. Three of them (`/om:status`, `/om:compact`, `/om:consolidate`) require the session gate to be on before they do anything useful. The gate command itself (`/om`) is always active.
+
+## Command summary
+
+| Command | Effect |
+|---|---|
+| `/om` | Toggle the session gate on or off |
+| `/om on` | Explicitly enable observational memory for this session |
+| `/om off` | Explicitly disable observational memory for this session |
+| `/om:status` | Show workers, observation buffer, memory state, context usage, and session cost |
+| `/om:compact` | Force a compaction immediately, ignoring the context threshold |
+| `/om:consolidate` | Force a consolidation immediately, ignoring the pool threshold |
+
+---
+
+## `/om`
+
+The per-session on/off gate. Running `/om` with no argument **toggles** the current state. Use `/om on` or `/om off` to set it explicitly.
+
+```
+/om          # toggle
+/om on       # enable
+/om off      # disable
+```
+
+**Gate state persistence:** enabling or disabling writes an `om.enabled` ledger entry to the current branch. The state is read back from the ledger at session start and on `/resume`, so it survives restarts. Because the entry lives in the branch-local ledger, the gate state is correct on every `/tree` branch independently.
+
+**What enabling does:**
+
+- Ensures the per-session `.memory/<sessionId>/` directory exists (seeding from a parent session if one exists).
+- Attaches the footer gauges (observation buffer, context bar, cost display) to the TUI.
+- Refreshes the footer and session cost display immediately.
+
+**What disabling does:**
+
+- Aborts all in-flight observer and consolidator subprocesses.
+- Detaches the footer gauges.
+
+<Note>
+All other commands (`/om:status`, `/om:compact`, `/om:consolidate`) are no-ops when the gate is off. Each one notifies "om is off (use /om on to enable)" and returns immediately.
+</Note>
+
+---
+
+## `/om:status`
+
+Prints a full snapshot of the extension's current state. Useful for diagnosing stalled observers, checking pool pressure before a manual consolidation, or confirming the context threshold.
+
+Example output:
+
+```
+om status
+  observers in flight: 2 / 4
+  active observations: 47
+  next observer: 6,200 / 10,000 tok
+  pool: 11,400 tok (target 10,000, consolidate at 15,000)
+  consolidator: idle
+  last compaction wait: waited
+  topic files: 3
+  journey: ~820 / 1,000 tok
+  context: 92,000 / 150,000 tok
+  session cost: $0.0023 (12 runs)
+  last error: none
+```
+
+### Output fields
+
+<ResponseField name="observers in flight" type="N / max">
+  Number of observer subprocesses currently running, out of the configured `observerConcurrency` maximum.
+</ResponseField>
+
+<ResponseField name="active observations" type="number">
+  Count of observations currently in the active buffer — recorded but not yet promoted to long-term storage.
+</ResponseField>
+
+<ResponseField name="next observer" type="tokens / chunkTokens">
+  Raw history tokens accumulated since the latest observer watermark, compared to `chunkTokens`. When this reaches `chunkTokens`, the next observer fires.
+</ResponseField>
+
+<ResponseField name="pool" type="tokens (target N, consolidate at N)">
+  Estimated token count of all active observations, the drain target (`poolTargetTokens`), and the consolidation trigger threshold (`consolidateAtPoolTokens`).
+</ResponseField>
+
+<ResponseField name="consolidator" type="running | idle">
+  Whether the consolidator subprocess is currently in flight. Only one consolidator runs at a time.
+</ResponseField>
+
+<ResponseField name="last compaction wait" type="skipped | waited | n/a">
+  Whether the most recent compaction waited for in-flight observers to settle before rendering (`waited`), skipped the wait because no in-flight observer could affect the rendered block (`skipped`), or has not compacted yet (`n/a`).
+</ResponseField>
+
+<ResponseField name="topic files" type="number">
+  Count of `<topic>.md` files in `.memory/<sessionId>/` — the durable long-term memory files authored by the consolidator.
+</ResponseField>
+
+<ResponseField name="journey" type="~N / target tok">
+  Estimated token size of `JOURNEY.md` compared to `journeyTargetTokens`. Displays `none yet` before the first consolidation.
+</ResponseField>
+
+<ResponseField name="context" type="tokens / threshold">
+  Live context-window usage compared to `compactAtContextTokens`. Derived from pi's built-in context-usage metric when available; falls back to counting raw tokens since the last compaction.
+</ResponseField>
+
+<ResponseField name="session cost" type="$N.NNNN (N runs)">
+  Total cost across all worker runs in this session (all branches), in USD. See [Cost Tracking](/guides/cost-tracking) for details.
+</ResponseField>
+
+<ResponseField name="last error" type="string | none">
+  The most recent worker error message, if any. Cleared on the next successful worker completion.
+</ResponseField>
+
+---
+
+## `/om:compact`
+
+Forces an immediate compaction, bypassing the `compactAtContextTokens` threshold check. This calls pi's `ctx.compact()` directly.
+
+```
+/om:compact
+```
+
+Before folding the ledger and rendering the compaction block, the `session_before_compact` hook runs. That hook waits for any in-flight observers (unless they can be proven not to affect the rendered block), then snaps the cutoff to an observation chunk boundary and renders the summary.
+
+**Guards:**
+
+- No-op when the gate is off.
+- Notifies and returns when a compaction is already in progress (`compactInFlight` is set).
+
+Calling `/om:compact` manually is safe at any time. It is equivalent to what the automatic threshold trigger fires, minus the threshold check.
+
+---
+
+## `/om:consolidate`
+
+Forces an immediate consolidation, bypassing the `consolidateAtPoolTokens` threshold check. Promotes the oldest observations above `poolTargetTokens` into durable `.memory/<sessionId>/` topic files via a consolidator subprocess.
+
+```
+/om:consolidate
+```
+
+If the active observation pool is at or below `poolTargetTokens`, there is nothing to promote and the command notifies you with the current pool size and target.
+
+**Guards:**
+
+- No-op when the gate is off.
+- Notifies and returns when a consolidator is already running (`consolidatorInFlight` is set).
+
+This command is useful for explicitly archiving a batch of observations before switching to a new topic area, or for testing the consolidator against a known observation set.
